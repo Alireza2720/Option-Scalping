@@ -19,7 +19,10 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
-app.get('/strategies.js', (req, res) => res.sendFile(path.join(__dirname, 'strategies.js')));
+app.get('/strategies.js', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(__dirname, 'strategies.js'));
+});
 
 // ==========================================================
 // زمان تهران
@@ -63,11 +66,47 @@ function todayDateString(tehran) {
 }
 
 // ==========================================================
-// کش لیست نمادهای بازار
+// سهمیه‌های روزانه (Candlestick و AllSymbols)
+// ==========================================================
+async function getUsageDoc(key) {
+    const db = getDB();
+    const today = todayDateString(getTehranParts());
+    let doc = await db.collection('meta').findOne({ _id: key });
+    if (!doc || doc.date !== today) {
+        doc = { _id: key, date: today, count: 0 };
+        await db.collection('meta').updateOne({ _id: key }, { $set: doc }, { upsert: true });
+    }
+    return doc;
+}
+
+async function incrementUsage(key) {
+    const db = getDB();
+    const today = todayDateString(getTehranParts());
+    await db.collection('meta').updateOne({ _id: key }, { $set: { date: today }, $inc: { count: 1 } }, { upsert: true });
+}
+
+app.get('/api/usage', async (req, res, next) => {
+    try {
+        const candlestick = await getUsageDoc('candlestick_usage');
+        const allsymbols = await getUsageDoc('allsymbols_usage');
+        res.json({
+            date: candlestick.date,
+            candlestick: `${candlestick.count}/10`,
+            allsymbols: `${allsymbols.count}/100`
+        });
+    } catch (err) { next(err); }
+});
+
+// ==========================================================
+// کش لیست نمادهای بازار (با شمارش سهمیه)
 // ==========================================================
 let symbolsCache = [];
 
-async function fetchAllSymbolsRaw() {
+async function fetchAllSymbolsRawCounted() {
+    await incrementUsage('allsymbols_usage');
+    const usage = await getUsageDoc('allsymbols_usage');
+    if (usage.count > 90) console.warn(`⚠️ مصرف AllSymbols به ${usage.count}/100 رسیده است.`);
+
     const url = `https://Api.BrsApi.ir/Tsetmc/AllSymbols.php?key=${API_KEY}&type=1`;
     const response = await fetch(url, {
         headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json, text/plain, */*' },
@@ -83,7 +122,7 @@ function updateSymbolsCacheFromRaw(raw) {
 
 async function refreshSymbolsCache() {
     try {
-        const raw = await fetchAllSymbolsRaw();
+        const raw = await fetchAllSymbolsRawCounted();
         updateSymbolsCacheFromRaw(raw);
         console.log(`✅ کش نمادها به‌روزرسانی شد: ${symbolsCache.length} نماد`);
     } catch (err) {
@@ -98,17 +137,14 @@ app.get('/api/symbols/search', (req, res) => {
 });
 
 // ==========================================================
-// اطلاعات استراتژی‌ها
+// اطلاعات استراتژی‌ها و تایم‌فریم‌ها
 // ==========================================================
 app.get('/api/strategies', (req, res) => {
     res.json(Object.values(STRATEGIES).map(s => ({
         id: s.id, name: s.name, defaultTimeframe: s.defaultTimeframe, defaultParams: s.defaultParams
     })));
 });
-
-app.get('/api/timeframes', (req, res) => {
-    res.json(Object.keys(TIMEFRAME_MINUTES));
-});
+app.get('/api/timeframes', (req, res) => res.json(Object.keys(TIMEFRAME_MINUTES)));
 
 // ==========================================================
 // نمادهای زیر نظر
@@ -118,7 +154,6 @@ app.get('/api/monitored-symbols', async (req, res, next) => {
         const db = getDB();
         const symbols = await db.collection('monitored_symbols').find({}).sort({ addedAt: 1 }).toArray();
         const today = todayDateString(getTehranParts());
-
         const enriched = await Promise.all(symbols.map(async (s) => {
             const [count, seedDoc] = await Promise.all([
                 db.collection('candles_base').countDocuments({ symbol: s.symbol }),
@@ -126,7 +161,6 @@ app.get('/api/monitored-symbols', async (req, res, next) => {
             ]);
             return { ...s, candleCount: count, seededToday: !!seedDoc };
         }));
-
         res.json(enriched);
     } catch (err) { next(err); }
 });
@@ -149,11 +183,8 @@ app.delete('/api/monitored-symbols/:id', async (req, res, next) => {
         const db = getDB();
         const doc = await db.collection('monitored_symbols').findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'یافت نشد' });
-
         const configCount = await db.collection('strategy_configs').countDocuments({ symbol: doc.symbol });
-        if (configCount > 0) {
-            return res.status(400).json({ error: `این نماد در ${configCount} تنظیم استراتژی استفاده شده است. ابتدا آن‌ها را حذف کنید.` });
-        }
+        if (configCount > 0) return res.status(400).json({ error: `این نماد در ${configCount} تنظیم استراتژی استفاده شده است. ابتدا آن‌ها را حذف کنید.` });
         await db.collection('monitored_symbols').deleteOne({ _id: new ObjectId(req.params.id) });
         res.json({ success: true });
     } catch (err) { next(err); }
@@ -181,8 +212,7 @@ app.post('/api/strategy-configs', async (req, res, next) => {
         if (!symbolExists) return res.status(400).json({ error: 'ابتدا باید این نماد را به لیست نمادهای زیر نظر اضافه کنید.' });
 
         const doc = {
-            symbol, strategyId,
-            timeframe,
+            symbol, strategyId, timeframe,
             candleType: candleType === 'simple' ? 'simple' : 'heikin',
             params: params || STRATEGIES[strategyId].defaultParams,
             enabled: enabled !== false,
@@ -215,7 +245,7 @@ app.delete('/api/strategy-configs/:id', async (req, res, next) => {
 });
 
 // ==========================================================
-// وضعیت فعلی هر تنظیم استراتژی
+// وضعیت فعلی + تاریخچه سیگنال‌ها
 // ==========================================================
 app.get('/api/status', async (req, res, next) => {
     try {
@@ -224,8 +254,24 @@ app.get('/api/status', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
+app.get('/api/signal-history', async (req, res, next) => {
+    try {
+        const db = getDB();
+        const history = await db.collection('signal_history').find({}).sort({ createdAt: -1 }).limit(300).toArray();
+        res.json(history);
+    } catch (err) { next(err); }
+});
+
+app.delete('/api/signal-history', async (req, res, next) => {
+    try {
+        const db = getDB();
+        await db.collection('signal_history').deleteMany({});
+        res.json({ success: true });
+    } catch (err) { next(err); }
+});
+
 // ==========================================================
-// کندل‌ها برای نمودار (تجمیع در لحظه از کالکشن پایه)
+// کندل‌ها برای نمودار
 // ==========================================================
 app.get('/api/candles/:symbol/:timeframe', async (req, res, next) => {
     const { symbol, timeframe } = req.params;
@@ -233,45 +279,13 @@ app.get('/api/candles/:symbol/:timeframe', async (req, res, next) => {
     try {
         const db = getDB();
         const base = await db.collection('candles_base').find({ symbol }).sort({ time: 1 }).toArray();
-        const baseFormatted = base.map(c => ({
-            time: Math.floor(c.time.getTime() / 1000),
-            open: c.open, high: c.high, low: c.low, close: c.close
-        }));
+        const baseFormatted = base.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close }));
         res.json(aggregateCandles(baseFormatted, TIMEFRAME_MINUTES[timeframe]));
     } catch (err) { next(err); }
 });
 
 // ==========================================================
-// سهمیه Candlestick
-// ==========================================================
-async function getUsageDoc() {
-    const db = getDB();
-    const today = todayDateString(getTehranParts());
-    let doc = await db.collection('meta').findOne({ _id: 'candlestick_usage' });
-    if (!doc || doc.date !== today) {
-        doc = { _id: 'candlestick_usage', date: today, count: 0 };
-        await db.collection('meta').updateOne({ _id: 'candlestick_usage' }, { $set: doc }, { upsert: true });
-    }
-    return doc;
-}
-
-async function incrementUsage() {
-    const db = getDB();
-    const today = todayDateString(getTehranParts());
-    await db.collection('meta').updateOne(
-        { _id: 'candlestick_usage' }, { $set: { date: today }, $inc: { count: 1 } }, { upsert: true }
-    );
-}
-
-app.get('/api/usage', async (req, res, next) => {
-    try {
-        const usage = await getUsageDoc();
-        res.json({ date: usage.date, candlestick: `${usage.count}/10` });
-    } catch (err) { next(err); }
-});
-
-// ==========================================================
-// Seed تاریخچه (اختیاری، هر نماد فقط یک‌بار در روز)
+// Seed تاریخچه (اختیاری)
 // ==========================================================
 function timeToMinutes(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
 
@@ -283,18 +297,14 @@ async function seedSymbolHistory(symbol) {
     const alreadySeeded = await db.collection('seed_log').findOne({ symbol, date: today });
     if (alreadySeeded) throw new Error('تاریخچه این نماد امروز قبلاً دریافت شده است.');
 
-    const usage = await getUsageDoc();
+    const usage = await getUsageDoc('candlestick_usage');
     if (usage.count >= 10) throw new Error('سهمیه روزانه Candlestick به پایان رسیده است.');
 
     const url = `https://Api.BrsApi.ir/Tsetmc/Candlestick.php?key=${API_KEY}&type=1&l18=${encodeURIComponent(symbol)}`;
-    const response = await fetch(url, {
-        headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json, text/plain, */*' },
-        timeout: 15000
-    });
-    await incrementUsage();
+    const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json, text/plain, */*' }, timeout: 15000 });
+    await incrementUsage('candlestick_usage');
 
     if (!response.ok) throw new Error(`BrsApi با کد ${response.status} پاسخ داد`);
-
     const data = await response.json();
     const intraday = data.candle_intraday;
     if (!Array.isArray(intraday) || intraday.length === 0) throw new Error('داده‌ای برای این نماد دریافت نشد');
@@ -310,18 +320,15 @@ async function seedSymbolHistory(symbol) {
         );
         count++;
     }
-
     await db.collection('seed_log').insertOne({ symbol, date: today, createdAt: new Date() });
     return { candlesAdded: count };
 }
 
-app.post('/api/seed/:symbol', async (req, res, next) => {
+app.post('/api/seed/:symbol', async (req, res) => {
     try {
         const result = await seedSymbolHistory(req.params.symbol);
         res.json({ success: true, ...result });
-    } catch (err) {
-        res.status(400).json({ error: err.message });
-    }
+    } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.post('/api/seed-all', async (req, res, next) => {
@@ -347,31 +354,24 @@ app.post('/api/seed-all', async (req, res, next) => {
 async function sendTelegramMessage(text) {
     if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) throw new Error('توکن یا chat_id تلگرام تنظیم نشده است.');
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-    const response = await fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text })
-    });
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }) });
     const data = await response.json();
     if (!data.ok) throw new Error(data.description || 'خطای نامشخص تلگرام');
     return data;
 }
 
 app.post('/api/test/telegram', async (req, res, next) => {
-    try {
-        await sendTelegramMessage('✅ این یک پیام آزمایشی از سیستم پایش سیگنال است.');
-        res.json({ success: true });
-    } catch (err) { next(err); }
+    try { await sendTelegramMessage('✅ این یک پیام آزمایشی از سیستم پایش سیگنال است.'); res.json({ success: true }); }
+    catch (err) { next(err); }
 });
 
 app.get('/api/test/mongo', async (req, res, next) => {
-    try {
-        await getDB().command({ ping: 1 });
-        res.json({ success: true, message: 'اتصال به MongoDB سالم است.' });
-    } catch (err) { next(err); }
+    try { await getDB().command({ ping: 1 }); res.json({ success: true, message: 'اتصال به MongoDB سالم است.' }); }
+    catch (err) { next(err); }
 });
 
 // ==========================================================
-// موتور اصلی: ساخت کندل زنده + اجرای استراتژی‌ها (هر ۳ دقیقه)
+// موتور اصلی: ساخت کندل زنده + اجرای استراتژی‌ها
 // ==========================================================
 async function upsertLiveCandle(symbol, time, price) {
     const db = getDB();
@@ -388,10 +388,7 @@ async function evaluateStrategyConfig(config) {
 
     const db = getDB();
     const base = await db.collection('candles_base').find({ symbol: config.symbol }).sort({ time: 1 }).toArray();
-    const baseFormatted = base.map(c => ({
-        time: Math.floor(c.time.getTime() / 1000),
-        open: c.open, high: c.high, low: c.low, close: c.close
-    }));
+    const baseFormatted = base.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close }));
     const candles = aggregateCandles(baseFormatted, TIMEFRAME_MINUTES[config.timeframe]);
 
     const configId = config._id.toString();
@@ -440,13 +437,18 @@ async function evaluateStrategyConfig(config) {
             console.error('❌ خطا در ارسال تلگرام:', err.message);
         }
         await stateColl.updateOne({ configId }, { $set: { lastNotifiedTime: lastSignal.time, lastNotifiedType: lastSignal.signalType } });
+
+        await db.collection('signal_history').insertOne({
+            symbol: config.symbol, strategyId: config.strategyId, strategyName: strategyDef.name,
+            signalType: lastSignal.signalType, price: lastPrice, time: lastSignal.time, createdAt: new Date()
+        });
     }
 }
 
 async function tick() {
     let raw;
     try {
-        raw = await fetchAllSymbolsRaw();
+        raw = await fetchAllSymbolsRawCounted();
     } catch (err) {
         console.error('❌ خطا در دریافت قیمت‌های لحظه‌ای:', err.message);
         return;
