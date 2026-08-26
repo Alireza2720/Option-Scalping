@@ -1,9 +1,3 @@
-// ==========================================================
-// strategies.js
-// هم در Node.js (بک‌اند) و هم در مرورگر (فرانت‌اند) قابل استفاده است.
-// شامل: محاسبات پایه، تجمیع تایم‌فریم، و تعریف استراتژی‌ها
-// ==========================================================
-
 (function (root, factory) {
     if (typeof module === 'object' && module.exports) {
         module.exports = factory();
@@ -12,9 +6,6 @@
     }
 })(typeof self !== 'undefined' ? self : this, function () {
 
-    // ------------------------------------------------------
-    // زمان تهران (بدون وابستگی به تنظیمات مرورگر/سرور)
-    // ------------------------------------------------------
     function getTehranParts(date) {
         const fmt = new Intl.DateTimeFormat('en-US', {
             timeZone: 'Asia/Tehran',
@@ -35,12 +26,7 @@
         return new Date(Date.UTC(year, month - 1, day, hour, minute, second || 0) - (3.5 * 60 * 60 * 1000));
     }
 
-    // ------------------------------------------------------
-    // تجمیع کندل‌های پایه به هر تایم‌فریم دلخواه (بر اساس ساعت تهران)
-    // ------------------------------------------------------
-    const TIMEFRAME_MINUTES = {
-        '3m': 3, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440
-    };
+    const TIMEFRAME_MINUTES = { '3m': 3, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440 };
 
     function aggregateCandles(baseCandles, timeframeMinutes) {
         const sorted = [...baseCandles].sort((a, b) => a.time - b.time);
@@ -66,9 +52,6 @@
         return Array.from(map.values()).sort((a, b) => a.time - b.time);
     }
 
-    // ------------------------------------------------------
-    // محاسبات پایه
-    // ------------------------------------------------------
     function calculateHeikinAshi(data) {
         const ha = [];
         for (let i = 0; i < data.length; i++) {
@@ -77,23 +60,13 @@
             const haOpen = i === 0 ? (c.open + c.close) / 2 : (ha[i-1].open + ha[i-1].close) / 2;
             const haHigh = Math.max(c.high, haOpen, haClose);
             const haLow = Math.min(c.low, haOpen, haClose);
-            ha.push({
-                time: c.time, open: haOpen, high: haHigh, low: haLow, close: haClose,
-                bullish: haClose > haOpen,
-                hasLowerShadow: haLow < Math.min(haOpen, haClose) - 0.01,
-                hasUpperShadow: haHigh > Math.max(haOpen, haClose) + 0.01
-            });
+            ha.push({ time: c.time, open: haOpen, high: haHigh, low: haLow, close: haClose, bullish: haClose > haOpen });
         }
         return ha;
     }
 
     function calculateSimpleCandles(data) {
-        return data.map(c => ({
-            time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
-            bullish: c.close > c.open,
-            hasLowerShadow: (Math.min(c.open, c.close) - c.low) > 0.01,
-            hasUpperShadow: (c.high - Math.max(c.open, c.close)) > 0.01
-        }));
+        return data.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, bullish: c.close > c.open }));
     }
 
     function getDisplayCandles(rawData, candleType) {
@@ -134,22 +107,15 @@
         return ema;
     }
 
-    // ------------------------------------------------------
-    // حداقل تعداد کندل لازم برای هر استراتژی (برای پیام‌های واضح به کاربر)
-    // ------------------------------------------------------
     function getRequiredCandles(strategyId, params) {
         if (strategyId === 'rsi50_2') return (params.rsiSlowPeriod || 50) + 2;
         if (strategyId === 'ema_heikin') return Math.max(params.emaFast || 25, params.emaMid || 50, params.emaSlow || 100) + 2;
         return 10;
     }
 
-    // ------------------------------------------------------
-    // استراتژی ۱: RSI50-2
-    // ------------------------------------------------------
     function runRSI50_2(rawData, params) {
         const rsiFastPeriod = params.rsiFastPeriod || 2;
         const rsiSlowPeriod = params.rsiSlowPeriod || 50;
-        const noShadowFilter = !!params.noShadowFilter;
         const candleType = params.candleType || 'heikin';
 
         const ha = getDisplayCandles(rawData, candleType);
@@ -170,51 +136,33 @@
             const fastBelowSlow = rsiFast[i] < rsiSlow[i];
             const candle = ha[i];
 
-            let buyCondition = fastAboveSlow && candle.bullish;
-            let sellCondition = fastBelowSlow && !candle.bullish;
-            if (noShadowFilter) {
-                buyCondition = buyCondition && !candle.hasLowerShadow;
-                sellCondition = sellCondition && !candle.hasUpperShadow;
-            }
+            const buyCondition = fastAboveSlow && candle.bullish;
+            const sellCondition = fastBelowSlow && !candle.bullish;
 
             let signalType = null;
             if (position === null) {
                 if (buyCondition) {
                     position = 'LONG'; signalType = 'BUY';
-                    trades.push({ type:'خرید', entryDate: rawData[i].time, entryPrice: rawData[i].close, exitDate:null, exitPrice:null });
+                    trades.push({ type:'خرید', entryDate: rawData[i].time, entryPrice: rawData[i].close });
                 } else if (sellCondition) {
                     position = 'SHORT'; signalType = 'SELL';
-                    trades.push({ type:'فروش', entryDate: rawData[i].time, entryPrice: rawData[i].close, exitDate:null, exitPrice:null });
+                    trades.push({ type:'فروش', entryDate: rawData[i].time, entryPrice: rawData[i].close });
                 }
             } else if (position === 'LONG' && fastBelowSlow) {
                 position = null; signalType = 'EXIT_LONG';
-                const lt = trades[trades.length-1];
-                lt.exitDate = rawData[i].time; lt.exitPrice = rawData[i].close;
-                lt.profit = (lt.exitPrice - lt.entryPrice) / lt.entryPrice * 100;
             } else if (position === 'SHORT' && fastAboveSlow) {
                 position = null; signalType = 'EXIT_SHORT';
-                const lt = trades[trades.length-1];
-                lt.exitDate = rawData[i].time; lt.exitPrice = rawData[i].close;
-                lt.profit = (lt.entryPrice - lt.exitPrice) / lt.entryPrice * 100;
             }
 
-            signals.push({
-                time: rawData[i].time,
-                indicators: { rsiFast: rsiFast[i], rsiSlow: rsiSlow[i] },
-                signalType, position
-            });
+            signals.push({ time: rawData[i].time, indicators: { rsiFast: rsiFast[i], rsiSlow: rsiSlow[i] }, signalType, position });
         }
         return { ha, signals, trades };
     }
 
-    // ------------------------------------------------------
-    // استراتژی ۲: EMA 25/50/100 + هیکن آشی
-    // ------------------------------------------------------
     function runEMA_HeikinAshi(rawData, params) {
         const emaFast = params.emaFast || 25;
         const emaMid = params.emaMid || 50;
         const emaSlow = params.emaSlow || 100;
-        const noShadowFilter = !!params.noShadowFilter;
         const candleType = params.candleType || 'heikin';
 
         const ha = getDisplayCandles(rawData, candleType);
@@ -237,65 +185,37 @@
             const aboveAll = price > ema25[i] && price > ema50[i] && price > ema100[i];
             const belowAll = price < ema25[i] && price < ema50[i] && price < ema100[i];
 
-            let buyCondition = aboveAll && candle.bullish;
-            let sellCondition = belowAll && !candle.bullish;
-            if (noShadowFilter) {
-                buyCondition = buyCondition && !candle.hasLowerShadow;
-                sellCondition = sellCondition && !candle.hasUpperShadow;
-            }
-
+            const buyCondition = aboveAll && candle.bullish;
+            const sellCondition = belowAll && !candle.bullish;
             const crossedEma25Down = price < ema25[i];
             const crossedEma25Up = price > ema25[i];
 
             let signalType = null;
             if (position === null) {
-                if (buyCondition) {
-                    position = 'LONG'; signalType = 'BUY';
-                    trades.push({ type:'خرید', entryDate: rawData[i].time, entryPrice: price, exitDate:null, exitPrice:null });
-                } else if (sellCondition) {
-                    position = 'SHORT'; signalType = 'SELL';
-                    trades.push({ type:'فروش', entryDate: rawData[i].time, entryPrice: price, exitDate:null, exitPrice:null });
-                }
+                if (buyCondition) { position = 'LONG'; signalType = 'BUY'; trades.push({ type:'خرید', entryDate: rawData[i].time, entryPrice: price }); }
+                else if (sellCondition) { position = 'SHORT'; signalType = 'SELL'; trades.push({ type:'فروش', entryDate: rawData[i].time, entryPrice: price }); }
             } else if (position === 'LONG' && crossedEma25Down) {
                 position = null; signalType = 'EXIT_LONG';
-                const lt = trades[trades.length-1];
-                lt.exitDate = rawData[i].time; lt.exitPrice = price;
-                lt.profit = (lt.exitPrice - lt.entryPrice) / lt.entryPrice * 100;
             } else if (position === 'SHORT' && crossedEma25Up) {
                 position = null; signalType = 'EXIT_SHORT';
-                const lt = trades[trades.length-1];
-                lt.exitDate = rawData[i].time; lt.exitPrice = price;
-                lt.profit = (lt.entryPrice - lt.exitPrice) / lt.entryPrice * 100;
             }
 
-            signals.push({
-                time: rawData[i].time,
-                indicators: { ema25: ema25[i], ema50: ema50[i] },
-                signalType, position
-            });
+            signals.push({ time: rawData[i].time, indicators: { ema25: ema25[i], ema50: ema50[i] }, signalType, position });
         }
         return { ha, signals, trades };
     }
 
-    // ------------------------------------------------------
-    // رجیستری استراتژی‌ها
-    // ------------------------------------------------------
     const STRATEGIES = {
         rsi50_2: {
-            id: 'rsi50_2',
-            name: 'RSI50-2',
-            defaultTimeframe: '1h',
-            defaultParams: { rsiFastPeriod: 2, rsiSlowPeriod: 50, noShadowFilter: false },
+            id: 'rsi50_2', name: 'RSI50-2', defaultTimeframe: '1h',
+            defaultParams: { rsiFastPeriod: 2, rsiSlowPeriod: 50 },
             run: runRSI50_2
         },
         ema_heikin: {
-            id: 'ema_heikin',
-            name: 'نوسان‌گیری EMA 25/50/100',
-            defaultTimeframe: '30m',
-            defaultParams: { emaFast: 25, emaMid: 50, emaSlow: 100, noShadowFilter: false },
+            id: 'ema_heikin', name: 'نوسان‌گیری EMA 25/50/100', defaultTimeframe: '30m',
+            defaultParams: { emaFast: 25, emaMid: 50, emaSlow: 100 },
             run: runEMA_HeikinAshi
         }
-        // استراتژی HR بعداً اینجا اضافه می‌شود
     };
 
     return {
