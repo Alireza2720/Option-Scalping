@@ -1,23 +1,74 @@
 // ==========================================================
 // strategies.js
-// این فایل هم در Node.js (بک‌اند) و هم در مرورگر (فرانت‌اند) قابل استفاده است.
-// شامل: محاسبات پایه (RSI, EMA, Heikin Ashi) + تعریف استراتژی‌ها
+// هم در Node.js (بک‌اند) و هم در مرورگر (فرانت‌اند) قابل استفاده است.
+// شامل: محاسبات پایه، تجمیع تایم‌فریم، و تعریف استراتژی‌ها
 // ==========================================================
 
 (function (root, factory) {
     if (typeof module === 'object' && module.exports) {
-        // محیط Node.js
         module.exports = factory();
     } else {
-        // محیط مرورگر
         root.TradingStrategies = factory();
     }
 })(typeof self !== 'undefined' ? self : this, function () {
 
     // ------------------------------------------------------
+    // زمان تهران (بدون وابستگی به تنظیمات مرورگر/سرور)
+    // ------------------------------------------------------
+    function getTehranParts(date) {
+        const fmt = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'Asia/Tehran',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false
+        });
+        const parts = fmt.formatToParts(date);
+        const map = {};
+        parts.forEach(p => { map[p.type] = p.value; });
+        return {
+            year: parseInt(map.year, 10), month: parseInt(map.month, 10), day: parseInt(map.day, 10),
+            hour: parseInt(map.hour, 10), minute: parseInt(map.minute, 10), second: parseInt(map.second, 10)
+        };
+    }
+
+    function tehranPartsToUTC(year, month, day, hour, minute, second) {
+        return new Date(Date.UTC(year, month - 1, day, hour, minute, second || 0) - (3.5 * 60 * 60 * 1000));
+    }
+
+    // ------------------------------------------------------
+    // تجمیع کندل‌های پایه به هر تایم‌فریم دلخواه (بر اساس ساعت تهران)
+    // ------------------------------------------------------
+    const TIMEFRAME_MINUTES = {
+        '3m': 3, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440
+    };
+
+    function aggregateCandles(baseCandles, timeframeMinutes) {
+        const sorted = [...baseCandles].sort((a, b) => a.time - b.time);
+        const map = new Map();
+        for (const c of sorted) {
+            const t = getTehranParts(new Date(c.time * 1000));
+            const minuteOfDay = t.hour * 60 + t.minute;
+            const bucketStart = Math.floor(minuteOfDay / timeframeMinutes) * timeframeMinutes;
+            const bucketHour = Math.floor(bucketStart / 60);
+            const bucketMinute = bucketStart % 60;
+            const key = `${t.year}-${t.month}-${t.day}-${bucketHour}-${bucketMinute}`;
+
+            if (!map.has(key)) {
+                const bucketTime = Math.floor(tehranPartsToUTC(t.year, t.month, t.day, bucketHour, bucketMinute).getTime() / 1000);
+                map.set(key, { time: bucketTime, open: c.open, high: c.high, low: c.low, close: c.close });
+            } else {
+                const b = map.get(key);
+                b.high = Math.max(b.high, c.high);
+                b.low = Math.min(b.low, c.low);
+                b.close = c.close;
+            }
+        }
+        return Array.from(map.values()).sort((a, b) => a.time - b.time);
+    }
+
+    // ------------------------------------------------------
     // محاسبات پایه
     // ------------------------------------------------------
-
     function calculateHeikinAshi(data) {
         const ha = [];
         for (let i = 0; i < data.length; i++) {
@@ -34,6 +85,19 @@
             });
         }
         return ha;
+    }
+
+    function calculateSimpleCandles(data) {
+        return data.map(c => ({
+            time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
+            bullish: c.close > c.open,
+            hasLowerShadow: (Math.min(c.open, c.close) - c.low) > 0.01,
+            hasUpperShadow: (c.high - Math.max(c.open, c.close)) > 0.01
+        }));
+    }
+
+    function getDisplayCandles(rawData, candleType) {
+        return candleType === 'simple' ? calculateSimpleCandles(rawData) : calculateHeikinAshi(rawData);
     }
 
     function calculateRSI(closes, period) {
@@ -71,14 +135,24 @@
     }
 
     // ------------------------------------------------------
-    // استراتژی ۱: RSI50-2 (تایم‌فریم پیشنهادی: ۱ ساعته)
+    // حداقل تعداد کندل لازم برای هر استراتژی (برای پیام‌های واضح به کاربر)
+    // ------------------------------------------------------
+    function getRequiredCandles(strategyId, params) {
+        if (strategyId === 'rsi50_2') return (params.rsiSlowPeriod || 50) + 2;
+        if (strategyId === 'ema_heikin') return Math.max(params.emaFast || 25, params.emaMid || 50, params.emaSlow || 100) + 2;
+        return 10;
+    }
+
+    // ------------------------------------------------------
+    // استراتژی ۱: RSI50-2
     // ------------------------------------------------------
     function runRSI50_2(rawData, params) {
         const rsiFastPeriod = params.rsiFastPeriod || 2;
         const rsiSlowPeriod = params.rsiSlowPeriod || 50;
         const noShadowFilter = !!params.noShadowFilter;
+        const candleType = params.candleType || 'heikin';
 
-        const ha = calculateHeikinAshi(rawData);
+        const ha = getDisplayCandles(rawData, candleType);
         const closes = rawData.map(d => d.close);
         const rsiFast = calculateRSI(closes, rsiFastPeriod);
         const rsiSlow = calculateRSI(closes, rsiSlowPeriod);
@@ -134,15 +208,16 @@
     }
 
     // ------------------------------------------------------
-    // استراتژی ۲: EMA 25/50/100 + Heikin Ashi (تایم‌فریم پیشنهادی: ۳۰ دقیقه)
+    // استراتژی ۲: EMA 25/50/100 + هیکن آشی
     // ------------------------------------------------------
     function runEMA_HeikinAshi(rawData, params) {
         const emaFast = params.emaFast || 25;
         const emaMid = params.emaMid || 50;
         const emaSlow = params.emaSlow || 100;
         const noShadowFilter = !!params.noShadowFilter;
+        const candleType = params.candleType || 'heikin';
 
-        const ha = calculateHeikinAshi(rawData);
+        const ha = getDisplayCandles(rawData, candleType);
         const closes = rawData.map(d => d.close);
         const ema25 = calculateEMA(closes, emaFast);
         const ema50 = calculateEMA(closes, emaMid);
@@ -154,7 +229,7 @@
 
         for (let i = 0; i < rawData.length; i++) {
             if (ema25[i] === null || ema50[i] === null || ema100[i] === null) {
-                signals.push({ time: rawData[i].time, indicators: { ema25: null, ema50: null, ema100: null }, signalType: null, position });
+                signals.push({ time: rawData[i].time, indicators: { ema25: null, ema50: null }, signalType: null, position });
                 continue;
             }
             const price = closes[i];
@@ -169,7 +244,6 @@
                 sellCondition = sellCondition && !candle.hasUpperShadow;
             }
 
-            // حد سود/خروج: قطع شدن قیمت با EMA25
             const crossedEma25Down = price < ema25[i];
             const crossedEma25Up = price > ema25[i];
 
@@ -196,7 +270,7 @@
 
             signals.push({
                 time: rawData[i].time,
-                indicators: { ema25: ema25[i], ema50: ema50[i], ema100: ema100[i] },
+                indicators: { ema25: ema25[i], ema50: ema50[i] },
                 signalType, position
             });
         }
@@ -204,20 +278,20 @@
     }
 
     // ------------------------------------------------------
-    // رجیستری استراتژی‌ها (نقطه‌ی توسعه در آینده)
+    // رجیستری استراتژی‌ها
     // ------------------------------------------------------
     const STRATEGIES = {
         rsi50_2: {
             id: 'rsi50_2',
             name: 'RSI50-2',
-            timeframe: '1h',
+            defaultTimeframe: '1h',
             defaultParams: { rsiFastPeriod: 2, rsiSlowPeriod: 50, noShadowFilter: false },
             run: runRSI50_2
         },
         ema_heikin: {
             id: 'ema_heikin',
-            name: 'نوسان‌گیری EMA 25/50/100 (هیکن آشی)',
-            timeframe: '30m',
+            name: 'نوسان‌گیری EMA 25/50/100',
+            defaultTimeframe: '30m',
             defaultParams: { emaFast: 25, emaMid: 50, emaSlow: 100, noShadowFilter: false },
             run: runEMA_HeikinAshi
         }
@@ -225,11 +299,9 @@
     };
 
     return {
-        calculateHeikinAshi,
-        calculateRSI,
-        calculateEMA,
-        runRSI50_2,
-        runEMA_HeikinAshi,
-        STRATEGIES
+        calculateHeikinAshi, calculateSimpleCandles, getDisplayCandles,
+        calculateRSI, calculateEMA,
+        aggregateCandles, TIMEFRAME_MINUTES, getRequiredCandles,
+        runRSI50_2, runEMA_HeikinAshi, STRATEGIES
     };
 });
