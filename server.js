@@ -10,6 +10,8 @@ const { STRATEGIES, TIMEFRAME_MINUTES, aggregateCandles, getRequiredCandles } = 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const SERVER_VERSION = 'v3.1-signal-history-fix';
+
 const API_KEY = process.env.BRSAPI_KEY;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -19,6 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
+app.get('/api/version', (req, res) => res.json({ version: SERVER_VERSION }));
 app.get('/strategies.js', (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(path.join(__dirname, 'strategies.js'));
@@ -484,7 +487,7 @@ async function tick() {
 // ==========================================================
 app.get('/', (req, res) => {
     res.json({
-        status: 'ok', apiKeyConfigured: !!API_KEY,
+        status: 'ok', version: SERVER_VERSION, apiKeyConfigured: !!API_KEY,
         telegramConfigured: !!(TELEGRAM_TOKEN && TELEGRAM_CHAT_ID),
         symbolsCached: symbolsCache.length, marketOpenNow: isMarketOpen(getTehranParts())
     });
@@ -508,7 +511,7 @@ async function start() {
 
     cron.schedule('0 7 * * *', () => refreshSymbolsCache(), { timezone: 'Asia/Tehran' });
 
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+    app.listen(PORT, () => console.log(`🚀 Server v${SERVER_VERSION} running on port ${PORT}`));
 }
 
 start().catch(err => {
