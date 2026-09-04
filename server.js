@@ -8,6 +8,7 @@ const { ObjectId } = require('mongodb');
 const { connectDB, getDB } = require('./db');
 const Strat = require('./strategies.js');
 const { STRATEGIES, aggregateCandles, getRequiredCandles } = Strat;
+const Options = require('./options.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -148,7 +149,10 @@ async function sendDailySummary() {
     const st = await getDB().collection('meta').findOne({ _id: `daystats_${today}` }) || {};
     const usage = await getAllUsage();
     const openTrades = await getDB().collection('trades').countDocuments({ status: 'open' });
-    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز: ${openTrades}\nمصرف API: ${usage.total}/${usage.totalLimit}`);
+    let optLine = '', storLine = '';
+    try { const list = await getDB().collection('option_positions').find({}).toArray(); const s = Options.positionStats(list); optLine = `\nآپشن: باز ${s.open} | بسته ${s.closed} | وین‌ریت ${s.winRate.toFixed(0)}٪ | بازده کل ${s.totalPnl.toFixed(0)}٪`; } catch (e) {}
+    try { const sg = await Options.storageStats(); storLine = `\nدیتابیس: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}`; } catch (e) {}
+    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
 
 // ---------------- تعطیلی (۱.۷) ----------------
@@ -408,8 +412,15 @@ async function evaluateStrategyConfig(config, marketInfo) {
 
     const tradesColl = db.collection('trades');
     if (last.signalType === 'BUY') {
-        if (!await tradesColl.findOne({ configId, status: 'open' }))
-            await tradesColl.insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, timeframe: config.timeframe, entryTime: last.time, entryPrice: lastPrice, entryIdx: candles.length - 1, reason: last.reason || null, inWindow, status: 'open', createdAt: new Date() });
+        let tradeId = null;
+        if (!await tradesColl.findOne({ configId, status: 'open' })) {
+            const ins = await tradesColl.insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, timeframe: config.timeframe, entryTime: last.time, entryPrice: lastPrice, entryIdx: candles.length - 1, reason: last.reason || null, inWindow, status: 'open', createdAt: new Date() });
+            tradeId = ins.insertedId;
+        }
+        if (inWindow && !(info && info.queue === 'buy')) {
+            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId }); }
+            catch (e) { console.error('❌ انتخاب آپشن:', e.message); await notify(`⚠️ انتخاب قرارداد آپشن برای ${config.symbol} ناموفق: ${e.message}`); }
+        } else await notify(`ℹ️ ${config.symbol}: به‌دلیل ${!inWindow ? 'خارج از بازه‌ی ورود' : 'صف خرید'} قرارداد آپشن پیشنهاد نشد.`);
     } else {
         const open = await tradesColl.findOne({ configId, status: 'open' });
         if (open) await tradesColl.updateOne({ _id: open._id }, { $set: { exitTime: last.time, exitPrice: lastPrice, pnlPct: (lastPrice / open.entryPrice - 1) * 100, bars: candles.length - 1 - (open.entryIdx || 0), exitReason: last.reason || null, status: 'closed', closedAt: new Date() } });
@@ -457,6 +468,15 @@ async function tick() {
             await upsertDailyCandle(m.symbol, dayTime, s);
         }
         const n = await evaluateAll(marketInfo);
+        try {
+            const openOpt = await Options.openPositionsCount();
+            if (tehran.minute % 5 === 0 || openOpt > 0) {
+                const chain = await Options.fetchChain(30000);
+                const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
+                if (tehran.minute % 5 === 0) await Options.storeSnapshots(chain, mset);
+                await Options.managePositions(chain);
+            }
+        } catch (e) { console.error('❌ آپشن:', e.message); }
         await flushOutbox();
         await recordTickSuccess();
         console.log(`⏱ ${tehran.hour}:${String(tehran.minute).padStart(2, '0')} | ${monitored.length} نماد | ${n} استراتژی | فعال بازار: ${active}`);
@@ -472,6 +492,9 @@ app.get('/', async (req, res) => {
         symbolsCached: symbolsCache.length, marketOpenNow: isMarketOpen(t), holidayToday: holidayDate === todayDateString(t),
         entryWindow: `${fmtMin(ENTRY_START)}-${fmtMin(ENTRY_END)}`, health: { ...health }, pendingOutbox });
 });
+Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
+Options.registerRoutes(app, ObjectId);
+
 app.use((req, res) => res.status(404).json({ error: 'مسیر یافت نشد' }));
 app.use((err, req, res, next) => { console.error('❌', err.message); res.status(500).json({ error: err.message || 'خطای داخلی' }); });
 
@@ -487,6 +510,8 @@ async function ensureIndexes() {
 async function start() {
     await connectDB();
     await ensureIndexes();
+    Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
+    await Options.ensureIndexes();
     await backfillDailyFromBase();
     const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
     if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
@@ -498,10 +523,18 @@ async function start() {
         if (!isMarketOpen(t) || holidayDate === todayDateString(t)) return;
         await tick();
     });
-    // ارزیابی پس از بسته شدن بازار (کندل ۱۱:۰۰ یک‌ساعته و کندل روزانه)
+    // ارزیابی پس از بسته شدن بازار (کندل ۱۱:۰۰ یک‌ساعته و کندل روزانه) + ذخیره‌ی پایان‌روز آپشن
     cron.schedule('32 12 * * 6,0,1,2,3', async () => {
         if (holidayDate === todayDateString(getTehranParts())) return;
-        try { await evaluateAll(null); await flushOutbox(); } catch (e) { console.error('❌ ارزیابی پس از بسته شدن:', e.message); }
+        try {
+            await evaluateAll(null);
+            const monitored = await getDB().collection('monitored_symbols').find({}).toArray();
+            const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
+            const chain = await Options.fetchChain(0);
+            await Options.storeEOD(chain, mset);
+            await Options.managePositions(chain);
+            await flushOutbox();
+        } catch (e) { console.error('❌ ارزیابی پس از بسته شدن:', e.message); }
     }, { timezone: 'Asia/Tehran' });
     cron.schedule('35 12 * * 6,0,1,2,3', () => { if (holidayDate !== todayDateString(getTehranParts())) sendDailySummary().catch(() => {}); }, { timezone: 'Asia/Tehran' });
 
