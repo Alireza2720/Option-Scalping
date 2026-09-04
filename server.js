@@ -8,7 +8,10 @@ const { ObjectId } = require('mongodb');
 const { connectDB, getDB } = require('./db');
 const Strat = require('./strategies.js');
 const { STRATEGIES, aggregateCandles, getRequiredCandles } = Strat;
-const Options = require('./options.js');
+const Options = require('./option.js');
+const Log = require('./log.js');
+Log.patchConsole();
+const STARTED_AT = new Date();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -30,7 +33,7 @@ const ENTRY_END = toMin(process.env.ENTRY_END || '12:00');
 const fmtMin = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 // ---------------- احراز هویت ادمین (۱.۶) ----------------
 app.use((req, res, next) => {
@@ -238,32 +241,44 @@ app.get('/api/chart-data/:configId', async (req, res, next) => {
     } catch (e) { next(e); }
 });
 
-// ---------------- وارد کردن تاریخچه‌ی روزانه از TSETMC (بدون سهمیه) ----------------
-async function importDailyHistory(symbol) {
-    const opts = { headers: { 'User-Agent': USER_AGENT }, timeout: 20000 };
-    const sr = await fetch(`http://old.tsetmc.com/tsev2/data/search.aspx?skey=${encodeURIComponent(symbol)}`, opts);
-    if (!sr.ok) throw new Error(`TSETMC search HTTP ${sr.status} (احتمالاً IP سرور مسدود است)`);
-    const rows = (await sr.text()).split(';').map(r => r.split(',')).filter(r => r.length > 3);
-    const hit = rows.find(r => r[0].trim() === symbol) || rows[0];
-    if (!hit) throw new Error('نماد در TSETMC پیدا نشد');
-    const insCode = hit[2];
-    const ex = await fetch(`http://old.tsetmc.com/tsev2/data/Export-txt.aspx?t=i&a=1&b=0&i=${insCode}`, opts);
-    if (!ex.ok) throw new Error(`TSETMC export HTTP ${ex.status}`);
-    const lines = (await ex.text()).trim().split('\n').slice(1);
+// ---------------- وارد کردن تاریخچه‌ی روزانه (TSETMC یا فایل CSV) ----------------
+// فرمت خروجی TSETMC: <TICKER>,<DTYYYYMMDD>,<FIRST>,<HIGH>,<LOW>,<CLOSE>,<VALUE>,<VOL>,<OPENINT>,<PER>,<OPEN>,<LAST>
+function parseTsetmcLines(text) {
+    return String(text || '').replace(/\r/g, '').split('\n').filter(l => /^[^,]+,\d{8},/.test(l)).map(l => l.split(','));
+}
+async function upsertDailyRows(symbol, rows) {
     const col = getDB().collection('candles_daily'); let added = 0;
-    for (const line of lines) {
-        const f = line.split(','); if (f.length < 12) continue;
-        const ds = f[1].trim(), y = +ds.slice(0, 4), mo = +ds.slice(4, 6), d = +ds.slice(6, 8);
-        const time = tehranPartsToUTCDate(y, mo, d, 0, 0);
+    for (const f of rows) {
+        if (f.length < 12) continue;
+        const ds = f[1].trim(), time = tehranPartsToUTCDate(+ds.slice(0, 4), +ds.slice(4, 6), +ds.slice(6, 8), 0, 0);
         const doc = { symbol, time, open: +f[2], high: +f[3], low: +f[4], close: +f[11] || +f[5], volume: +f[7] || 0, source: 'tsetmc' };
+        if (!(doc.close > 0)) continue;
         const r = await col.updateOne({ symbol, time }, { $setOnInsert: doc }, { upsert: true });
         if (r.upsertedCount) added++;
     }
-    return { added, total: lines.length };
+    return { added, total: rows.length };
+}
+async function importDailyHistory(symbol) {
+    const opts = { headers: { 'User-Agent': USER_AGENT }, timeout: 20000 };
+    const sr = await fetch(`http://old.tsetmc.com/tsev2/data/search.aspx?skey=${encodeURIComponent(symbol)}`, opts);
+    if (!sr.ok) throw new Error(`TSETMC search HTTP ${sr.status} (IP سرور مسدود است؛ از گزینه‌ی 📄 آپلود فایل استفاده کنید)`);
+    const rows = (await sr.text()).split(';').map(r => r.split(',')).filter(r => r.length > 3);
+    const hit = rows.find(r => r[0].trim() === symbol) || rows[0];
+    if (!hit) throw new Error('نماد در TSETMC پیدا نشد');
+    const ex = await fetch(`http://old.tsetmc.com/tsev2/data/Export-txt.aspx?t=i&a=1&b=0&i=${hit[2]}`, opts);
+    if (!ex.ok) throw new Error(`TSETMC export HTTP ${ex.status}`);
+    return upsertDailyRows(symbol, parseTsetmcLines(await ex.text()));
 }
 app.post('/api/import-daily/:symbol', async (req, res) => {
     try { res.json({ success: true, ...(await importDailyHistory(req.params.symbol)) }); }
-    catch (e) { res.status(400).json({ error: e.message }); }
+    catch (e) { console.error('❌ import-daily:', e.message); res.status(400).json({ error: e.message }); }
+});
+app.post('/api/import-daily-text/:symbol', async (req, res) => {
+    try {
+        const rows = parseTsetmcLines(req.body && req.body.text);
+        if (!rows.length) return res.status(400).json({ error: 'هیچ سطر معتبری در فایل پیدا نشد (فرمت باید خروجی «سابقه» TSETMC باشد)' });
+        res.json({ success: true, ...(await upsertDailyRows(req.params.symbol, rows)) });
+    } catch (e) { console.error('❌ import-daily-text:', e.message); res.status(400).json({ error: e.message }); }
 });
 
 // ---------------- نمادهای زیر نظر ----------------
@@ -488,14 +503,21 @@ async function tick() {
 app.get('/', async (req, res) => {
     let pendingOutbox = 0; try { pendingOutbox = await getDB().collection('telegram_outbox').countDocuments({ sentAt: null }); } catch (e) {}
     const t = getTehranParts();
-    res.json({ status: 'ok', version: SERVER_VERSION, apiKeysConfigured: API_KEYS.length, adminRequired: !!ADMIN_TOKEN, telegramConfigured: !!(TELEGRAM_TOKEN && TELEGRAM_CHAT_ID),
+    res.json({ status: 'ok', version: SERVER_VERSION, startedAt: STARTED_AT, commit: process.env.RENDER_GIT_COMMIT || null, apiKeysConfigured: API_KEYS.length, adminRequired: !!ADMIN_TOKEN, telegramConfigured: !!(TELEGRAM_TOKEN && TELEGRAM_CHAT_ID),
         symbolsCached: symbolsCache.length, marketOpenNow: isMarketOpen(t), holidayToday: holidayDate === todayDateString(t),
         entryWindow: `${fmtMin(ENTRY_START)}-${fmtMin(ENTRY_END)}`, health: { ...health }, pendingOutbox });
 });
-Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
+app.get('/api/logs', async (req, res, next) => {
+    try {
+        if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN) return res.status(401).json({ error: 'توکن ادمین نامعتبر است' });
+        const limit = Math.min(+req.query.limit || 200, 1000);
+        if (req.query.source === 'db') return res.json({ logs: await getDB().collection('logs').find({}).sort({ at: -1 }).limit(limit).toArray() });
+        res.json({ logs: Log.recent(limit, req.query.level || undefined) });
+    } catch (e) { next(e); }
+});
 Options.registerRoutes(app, ObjectId);
 
-app.use((req, res) => res.status(404).json({ error: 'مسیر یافت نشد' }));
+app.use((req, res) => { Log.push('warn', `404 ${req.method} ${req.originalUrl}`); res.status(404).json({ error: 'مسیر یافت نشد' }); });
 app.use((err, req, res, next) => { console.error('❌', err.message); res.status(500).json({ error: err.message || 'خطای داخلی' }); });
 
 // ---------------- راه‌اندازی ----------------
@@ -506,9 +528,11 @@ async function ensureIndexes() {
     await db.collection('telegram_outbox').createIndex({ sentAt: 1 }, { expireAfterSeconds: 7 * 86400 });
     await db.collection('trades').createIndex({ configId: 1, status: 1 });
     await db.collection('signal_history').createIndex({ createdAt: -1 });
+    await Log.ensureIndexes(db);
 }
 async function start() {
     await connectDB();
+    Log.init(getDB);
     await ensureIndexes();
     Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
     await Options.ensureIndexes();

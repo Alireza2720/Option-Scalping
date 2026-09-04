@@ -25,9 +25,6 @@ async function ensureIndexes(database) {
     await database.collection('candles_base').createIndex({ time: 1 }, { expireAfterSeconds: FORTY_FIVE_DAYS });
     await database.collection('candles_base').createIndex({ symbol: 1, time: 1 }, { unique: true });
 
-    // کندل‌های دائمی تایم‌فریم بالا (۱h و ۱d)
-    await database.collection('candles_tf').createIndex({ symbol: 1, tf: 1, time: 1 }, { unique: true });
-
     await database.collection('signal_history').createIndex({ createdAt: -1 });
     await database.collection('signals_state').createIndex({ configId: 1 }, { unique: true });
     await database.collection('notify_queue').createIndex({ createdAt: 1 });
@@ -38,8 +35,10 @@ async function ensureIndexes(database) {
 async function cleanupLegacy(database) {
     try {
         await database.collection('meta').deleteMany({ _id: { $in: ['candlestick_usage', 'allsymbols_usage'] } });
-        const cols = await database.listCollections({ name: 'seed_log' }).toArray();
-        if (cols.length) await database.collection('seed_log').drop();
+        for (const name of ['seed_log', 'candles_tf']) {
+            const cols = await database.listCollections({ name }).toArray();
+            if (cols.length) await database.collection(name).drop();
+        }
     } catch (e) { /* بی‌اهمیت */ }
 }
 
