@@ -18,7 +18,7 @@
         parts.forEach(p => { map[p.type] = p.value; });
         return {
             year: parseInt(map.year, 10), month: parseInt(map.month, 10), day: parseInt(map.day, 10),
-            hour: parseInt(map.hour, 10), minute: parseInt(map.minute, 10), second: parseInt(map.second, 10)
+            hour: parseInt(map.hour, 10) % 24, minute: parseInt(map.minute, 10), second: parseInt(map.second, 10)
         };
     }
 
@@ -26,7 +26,10 @@
         return new Date(Date.UTC(year, month - 1, day, hour, minute, second || 0) - (3.5 * 60 * 60 * 1000));
     }
 
-    const TIMEFRAME_MINUTES = { '3m': 3, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440 };
+    const TIMEFRAME_MINUTES = {
+        '1m': 1, '3m': 3, '5m': 5, '10m': 10, '15m': 15, '30m': 30,
+        '1h': 60, '4h': 240, '1d': 1440
+    };
 
     function aggregateCandles(baseCandles, timeframeMinutes) {
         const sorted = [...baseCandles].sort((a, b) => a.time - b.time);
@@ -108,6 +111,7 @@
     }
 
     function getRequiredCandles(strategyId, params) {
+        params = params || {};
         if (strategyId === 'rsi50_2') return (params.rsiSlowPeriod || 50) + 2;
         if (strategyId === 'ema_heikin') return Math.max(params.emaFast || 25, params.emaMid || 50, params.emaSlow || 100) + 2;
         return 10;
@@ -160,60 +164,65 @@
     }
 
     function runEMA_HeikinAshi(rawData, params) {
-        const emaFast = params.emaFast || 25;
-        const emaMid = params.emaMid || 50;
-        const emaSlow = params.emaSlow || 100;
+        const emaFastP = params.emaFast || 25;
+        const emaMidP = params.emaMid || 50;
+        const emaSlowP = params.emaSlow || 100;
         const candleType = params.candleType || 'heikin';
 
         const ha = getDisplayCandles(rawData, candleType);
         const closes = rawData.map(d => d.close);
-        const ema25 = calculateEMA(closes, emaFast);
-        const ema50 = calculateEMA(closes, emaMid);
-        const ema100 = calculateEMA(closes, emaSlow);
+        const eFast = calculateEMA(closes, emaFastP);
+        const eMid = calculateEMA(closes, emaMidP);
+        const eSlow = calculateEMA(closes, emaSlowP);
 
         const signals = [];
         let position = null;
         const trades = [];
 
         for (let i = 0; i < rawData.length; i++) {
-            if (ema25[i] === null || ema50[i] === null || ema100[i] === null) {
-                signals.push({ time: rawData[i].time, indicators: { ema25: null, ema50: null }, signalType: null, position });
+            const indicators = { emaFast: eFast[i], emaMid: eMid[i], emaSlow: eSlow[i] };
+            if (eFast[i] === null || eMid[i] === null || eSlow[i] === null) {
+                signals.push({ time: rawData[i].time, indicators, signalType: null, position });
                 continue;
             }
             const price = closes[i];
             const candle = ha[i];
-            const aboveAll = price > ema25[i] && price > ema50[i] && price > ema100[i];
-            const belowAll = price < ema25[i] && price < ema50[i] && price < ema100[i];
+            const aboveAll = price > eFast[i] && price > eMid[i] && price > eSlow[i];
+            const belowAll = price < eFast[i] && price < eMid[i] && price < eSlow[i];
 
             const buyCondition = aboveAll && candle.bullish;
             const sellCondition = belowAll && !candle.bullish;
-            const crossedEma25Down = price < ema25[i];
-            const crossedEma25Up = price > ema25[i];
+            const crossedFastDown = price < eFast[i];
+            const crossedFastUp = price > eFast[i];
 
             let signalType = null;
             if (position === null) {
                 if (buyCondition) { position = 'LONG'; signalType = 'BUY'; trades.push({ type:'خرید', entryDate: rawData[i].time, entryPrice: price }); }
                 else if (sellCondition) { position = 'SHORT'; signalType = 'SELL'; trades.push({ type:'فروش', entryDate: rawData[i].time, entryPrice: price }); }
-            } else if (position === 'LONG' && crossedEma25Down) {
+            } else if (position === 'LONG' && crossedFastDown) {
                 position = null; signalType = 'EXIT_LONG';
-            } else if (position === 'SHORT' && crossedEma25Up) {
+            } else if (position === 'SHORT' && crossedFastUp) {
                 position = null; signalType = 'EXIT_SHORT';
             }
 
-            signals.push({ time: rawData[i].time, indicators: { ema25: ema25[i], ema50: ema50[i] }, signalType, position });
+            signals.push({ time: rawData[i].time, indicators, signalType, position });
         }
         return { ha, signals, trades };
     }
 
+    // indicators.overlay  → روی نمودار قیمت رسم می‌شود
+    // indicators.panel    → در پنل جداگانه زیر نمودار قیمت
     const STRATEGIES = {
         rsi50_2: {
             id: 'rsi50_2', name: 'RSI50-2', defaultTimeframe: '1h',
             defaultParams: { rsiFastPeriod: 2, rsiSlowPeriod: 50 },
+            indicators: { overlay: [], panel: ['rsiFast', 'rsiSlow'] },
             run: runRSI50_2
         },
         ema_heikin: {
             id: 'ema_heikin', name: 'نوسان‌گیری EMA 25/50/100', defaultTimeframe: '30m',
             defaultParams: { emaFast: 25, emaMid: 50, emaSlow: 100 },
+            indicators: { overlay: ['emaFast', 'emaMid', 'emaSlow'], panel: [] },
             run: runEMA_HeikinAshi
         }
     };
