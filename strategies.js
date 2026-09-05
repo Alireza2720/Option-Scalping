@@ -15,6 +15,11 @@
     const TIMEFRAME_MINUTES = { '1m': 1, '3m': 3, '5m': 5, '10m': 10, '15m': 15, '30m': 30, '1h': 60, '1d': 1440 };
 
     // ---------------- تجمیع کندل ----------------
+    const SESSION_START_MIN = 9 * 60, SESSION_END_MIN = 12 * 60 + 30;
+    function expectedBarsFor(bucketStartMin, tfMin) {
+        const overlap = Math.max(0, Math.min(bucketStartMin + tfMin, SESSION_END_MIN) - Math.max(bucketStartMin, SESSION_START_MIN));
+        return Math.min(tfMin, overlap) || tfMin;
+    }
     function aggregateCandles(baseCandles, tfMin) {
         const sorted = [...baseCandles].sort((a, b) => a.time - b.time);
         const map = new Map();
@@ -24,12 +29,12 @@
             const bh = Math.floor(b / 60), bm = b % 60;
             const key = `${t.year}-${t.month}-${t.day}-${bh}-${bm}`;
             if (!map.has(key)) {
-                map.set(key, { time: Math.floor(tehranPartsToUTC(t.year, t.month, t.day, bh, bm).getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 });
+                map.set(key, { time: Math.floor(tehranPartsToUTC(t.year, t.month, t.day, bh, bm).getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, barCount: 1, expectedBars: expectedBarsFor(b, tfMin) });
             } else {
-                const x = map.get(key); x.high = Math.max(x.high, c.high); x.low = Math.min(x.low, c.low); x.close = c.close; x.volume += c.volume || 0;
+                const x = map.get(key); x.high = Math.max(x.high, c.high); x.low = Math.min(x.low, c.low); x.close = c.close; x.volume += c.volume || 0; x.barCount++;
             }
         }
-        return Array.from(map.values()).sort((a, b) => a.time - b.time);
+        return Array.from(map.values()).map(x => ({ ...x, complete: x.barCount >= Math.max(1, x.expectedBars) * 0.6 })).sort((a, b) => a.time - b.time);
     }
 
     // ---------------- کندل‌ها ----------------
@@ -40,11 +45,11 @@
             const close = (c.open + c.high + c.low + c.close) / 4;
             const open = i === 0 ? (c.open + c.close) / 2 : (ha[i - 1].open + ha[i - 1].close) / 2;
             const high = Math.max(c.high, open, close), low = Math.min(c.low, open, close);
-            ha.push({ time: c.time, open, high, low, close, bullish: close > open });
+            ha.push({ time: c.time, open, high, low, close, bullish: close > open, complete: c.complete !== false });
         }
         return ha;
     }
-    function calculateSimpleCandles(data) { return data.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, bullish: c.close > c.open })); }
+    function calculateSimpleCandles(data) { return data.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, bullish: c.close > c.open, complete: c.complete !== false })); }
     function getDisplayCandles(data, candleType) { return candleType === 'simple' ? calculateSimpleCandles(data) : calculateHeikinAshi(data); }
     // کندل HA «قوی»: بدون سایه‌ی پایین (با تلورانس ۰.۱٪)
     function noLowerWick(h) { return h.low >= Math.min(h.open, h.close) * 0.999; }

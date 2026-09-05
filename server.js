@@ -131,7 +131,9 @@ async function notify(text) {
     await getDB().collection('telegram_outbox').insertOne({ text, createdAt: new Date(), attempts: 0, sentAt: null });
     flushOutbox().catch(() => {});
 }
-
+app.post('/api/telegram/test', async (req, res, next) => {
+    try { await notify('🔔 پیام تست — اگر این را در تلگرام می‌بینید، ارسال سالم است.'); await flushOutbox(); res.json({ success: true }); } catch (e) { next(e); }
+});
 // ---------------- سلامت سیستم (۱.۴) ----------------
 const health = { consecutiveFailures: 0, alerted: false, lastError: null, lastTickAt: null };
 async function bumpDayStat(field, n = 1) {
@@ -158,13 +160,38 @@ async function sendDailySummary() {
     await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
 
-// ---------------- تعطیلی (۱.۷) ----------------
-let holidayDate = null, inactiveTicks = 0;
+// ---------------- بکاپ هفتگی تنظیمات (Atlas رایگان بکاپ خودکار ندارد) ----------------
+async function telegramSendBackup(filename, jsonObj) {
+    if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) throw new Error('تلگرام تنظیم نشده است');
+    const blob = new Blob([JSON.stringify(jsonObj, null, 2)], { type: 'application/json' });
+    const form = new FormData();
+    form.append('chat_id', TELEGRAM_CHAT_ID);
+    form.append('caption', `💾 بکاپ تنظیمات (${todayDateString(getTehranParts())})`);
+    form.append('document', blob, filename);
+    const r = await globalThis.fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`, { method: 'POST', body: form });
+    const d = await r.json(); if (!d.ok) throw new Error(d.description || 'خطای ارسال بکاپ به تلگرام');
+}
+async function sendWeeklyBackup() {
+    const db = getDB();
+    const [symbols, configs, optSettings] = await Promise.all([
+        db.collection('monitored_symbols').find({}).toArray(),
+        db.collection('strategy_configs').find({}).toArray(),
+        db.collection('meta').findOne({ _id: 'option_settings' })
+    ]);
+    await telegramSendBackup(`backup_${todayDateString(getTehranParts())}.json`, { exportedAt: new Date(), monitoredSymbols: symbols, strategyConfigs: configs, optionSettings: optSettings || null });
+}
+app.post('/api/backup/run', async (req, res, next) => { try { await sendWeeklyBackup(); res.json({ success: true }); } catch (e) { next(e); } });
+
+// ---------------- تعطیلی (۱.۷) ----------------let holidayDate = null, inactiveTicks = 0;
 async function markHoliday(t) {
     holidayDate = todayDateString(t);
     await getDB().collection('meta').updateOne({ _id: 'holiday' }, { $set: { date: holidayDate } }, { upsert: true });
     await notify(`📅 امروز (${holidayDate}) معامله‌ای در بازار دیده نشد؛ احتمالاً تعطیل است. پایش تا فردا متوقف شد.`);
 }
+// برداشتن دستی علامت تعطیلی (نیاز به توکن ادمین دارد چون DELETE است)
+app.delete('/api/holiday', async (req, res, next) => {
+    try { holidayDate = null; inactiveTicks = 0; await getDB().collection('meta').deleteOne({ _id: 'holiday' }); res.json({ success: true }); } catch (e) { next(e); }
+});
 
 // ---------------- کندل‌ها ----------------
 async function getBaseCandles(symbol) {
@@ -179,7 +206,12 @@ function mergeSessionTail(candles, tfMin) {
         const t = getTehranParts(new Date(c.time * 1000)), prev = out[out.length - 1];
         if (t.hour === 12 && prev) {
             const pt = getTehranParts(new Date(prev.time * 1000));
-            if (pt.day === t.day && pt.month === t.month && pt.hour === 11) { prev.high = Math.max(prev.high, c.high); prev.low = Math.min(prev.low, c.low); prev.close = c.close; continue; }
+            if (pt.day === t.day && pt.month === t.month && pt.hour === 11) {
+                prev.high = Math.max(prev.high, c.high); prev.low = Math.min(prev.low, c.low); prev.close = c.close;
+                prev.barCount = (prev.barCount || 0) + (c.barCount || 0); prev.expectedBars = (prev.expectedBars || 0) + (c.expectedBars || 0);
+                prev.complete = prev.barCount >= Math.max(1, prev.expectedBars) * 0.6;
+                continue;
+            }
         }
         out.push({ ...c });
     }
@@ -190,7 +222,35 @@ async function getCandles(symbol, tf) {
         const d = await getDB().collection('candles_daily').find({ symbol }).sort({ time: 1 }).toArray();
         return d.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 }));
     }
-    return mergeSessionTail(aggregateCandles(await getBaseCandles(symbol), TF[tf]), TF[tf]);
+    // کندل‌های دائمی (روزهای قدیمی‌تر از پنجره‌ی ۴۵ روزه) + کندل‌های زنده (تازه‌تر، از داده‌ی پایه)
+    const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
+    const live = mergeSessionTail(aggregateCandles(await getBaseCandles(symbol), TF[tf]), TF[tf]);
+    const map = new Map(permanent.map(c => [Math.floor(c.time.getTime() / 1000), { time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete }]));
+    for (const c of live) map.set(c.time, c); // داده‌ی زنده (دقیق‌تر برای روزهای اخیر) جایگزین می‌شود
+    return Array.from(map.values()).sort((a, b) => a.time - b.time);
+}
+async function activeConfigTimeframes() {
+    const configs = await getDB().collection('strategy_configs').find({}).toArray();
+    const set = new Set();
+    configs.forEach(c => { if (TF[c.timeframe] && c.timeframe !== '1d') set.add(c.timeframe); if (TF[c.htfTimeframe] && c.htfTimeframe !== '1d') set.add(c.htfTimeframe); });
+    return set;
+}
+// ذخیره‌ی دائمی کندل‌های روزهای گذشته قبل از اینکه از پنجره‌ی ۴۵ روزه‌ی candles_base خارج شوند
+async function persistTfCandles() {
+    const db = getDB(), tfs = await activeConfigTimeframes(); if (!tfs.size) return;
+    const todayStart = Math.floor(dayStartUTC(getTehranParts()).getTime() / 1000);
+    const monitored = await db.collection('monitored_symbols').find({}).toArray();
+    for (const m of monitored) {
+        const base = await getBaseCandles(m.symbol); if (!base.length) continue;
+        for (const tf of tfs) {
+            const candles = mergeSessionTail(aggregateCandles(base, TF[tf]), TF[tf]);
+            for (const c of candles) {
+                if (c.time >= todayStart) continue; // کندل امروز هنوز کامل نیست
+                await db.collection('candles_tf').updateOne({ symbol: m.symbol, tf, time: new Date(c.time * 1000) },
+                    { $set: { symbol: m.symbol, tf, time: new Date(c.time * 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete } }, { upsert: true });
+            }
+        }
+    }
 }
 // ۱.۱: فقط کندل‌های بسته‌شده
 function isCandleClosed(timeSec, tfMin, now = new Date()) {
@@ -398,15 +458,25 @@ async function evaluateStrategyConfig(config, marketInfo) {
     let result;
     try { result = def.run(candles, { ...config.params, candleType: config.candleType }, { htfCandles, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } }); }
     catch (e) { console.error(`❌ استراتژی ${config.symbol}:`, e.message); return; }
-    const last = result.signals[result.signals.length - 1]; if (!last) return;
-    const lastPrice = candles[candles.length - 1].close;
     const prev = await stateColl.findOne({ configId });
+    const latest = result.signals[result.signals.length - 1]; if (!latest) return;
+    const prevNotified = prev && prev.lastNotifiedTime || 0;
+    // آخرین سیگنال عمل‌پذیر که بعد از آخرین اعلان رخ داده (حداکثر ۵ کندل عقب‌تر)
+    let last = latest;
+    for (let i = result.signals.length - 1, k = 0; i >= 0 && k < 5; i--, k++) {
+        const s = result.signals[i];
+        if ((s.signalType === 'BUY' || s.signalType === 'EXIT_LONG') && s.time > prevNotified) { last = s; break; }
+    }
+    const late = last !== latest;
+    const lastPrice = candles[candles.length - 1].close;
 
-    await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: false, position: last.position, indicators: last.indicators, price: lastPrice, lastCandleTime: last.time, htfTrend: result.htfTrend || null, reason: last.reason || null } }, { upsert: true });
+    await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: false, position: latest.position, indicators: latest.indicators, price: lastPrice, lastCandleTime: latest.time, htfTrend: result.htfTrend || null, reason: latest.reason || null } }, { upsert: true });
 
     const label = `${config.symbol} | ${def.name} | ${config.timeframe}→${htfTf}`;
+    const lastHa = result.ha.find(h => h.time === last.time);
+    const incompleteTag = lastHa && lastHa.complete === false ? '\n⚠️ این کندل داده‌ی ناقص دارد — احتمال قطعی سرور یا توقف نماد' : '';
     // ۱.۱: لغو سیگنال (موقعیت بدون سیگنال خروج ناپدید شد)
-    if (prev && prev.position === 'LONG' && last.position !== 'LONG' && last.signalType !== 'EXIT_LONG') {
+    if (prev && prev.position === 'LONG' && latest.position !== 'LONG' && last.signalType !== 'EXIT_LONG') {
         await notify(`⚠️ لغو سیگنال\n${label}\nموقعیت خرید قبلی در محاسبه‌ی جدید وجود ندارد. اگر آپشن خریده‌اید، بازبینی کنید.`);
         await bumpDayStat('cancels');
     }
@@ -418,11 +488,11 @@ async function evaluateStrategyConfig(config, marketInfo) {
     const inWindow = nowMin >= ENTRY_START && nowMin <= ENTRY_END;
     const queueTag = info && info.queue === 'buy' ? '\n⚠️ صف خرید — آپشن احتمالاً گران شده' : info && info.queue === 'sell' ? '\n⚠️ صف فروش' : '';
     const windowTag = last.signalType === 'BUY' && !inWindow ? `\n⏸ خارج از بازه‌ی ورود (${fmtMin(ENTRY_START)}–${fmtMin(ENTRY_END)}) — توصیه: ورود نکن` : '';
-    const title = last.signalType === 'BUY' ? '📈 سیگنال خرید (کال)' : '🔔 خروج از خرید (بستن کال)';
-    const text = `${title}\n${label}\nروند ${htfTf}: ${result.htfTrend || '-'}\nقیمت بسته‌شدن: ${lastPrice.toLocaleString()}${info ? ` | لحظه‌ای: ${info.price.toLocaleString()}` : ''}\nدلیل: ${last.reason || '-'}${queueTag}${windowTag}`;
+    const title = (last.signalType === 'BUY' ? '📈 سیگنال خرید (کال)' : '🔔 خروج از خرید (بستن کال)') + (late ? ' ⏰ (با تأخیر — کندل قبلاً بسته شده)' : '');
+    const text = `${title}\n${label}\nروند ${htfTf}: ${result.htfTrend || '-'}\nقیمت بسته‌شدن: ${lastPrice.toLocaleString()}${info ? ` | لحظه‌ای: ${info.price.toLocaleString()}` : ''}\nدلیل: ${last.reason || '-'}${queueTag}${windowTag}${incompleteTag}`;
     await notify(text);
     await stateColl.updateOne({ configId }, { $set: { lastNotifiedTime: last.time, lastNotifiedType: last.signalType } });
-    await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, createdAt: new Date() });
+    await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, incomplete: !!(lastHa && lastHa.complete === false), createdAt: new Date() });
     await bumpDayStat('signals');
 
     const tradesColl = db.collection('trades');
@@ -499,6 +569,10 @@ async function tick() {
     finally { tickRunning = false; }
 }
 
+app.post('/api/evaluate-now', async (req, res, next) => {
+    try { await tick(); res.json({ success: true, lastTickAt: health.lastTickAt, lastError: health.lastError, consecutiveFailures: health.consecutiveFailures }); } catch (e) { next(e); }
+});
+
 // ---------------- وضعیت ----------------
 app.get('/', async (req, res) => {
     let pendingOutbox = 0; try { pendingOutbox = await getDB().collection('telegram_outbox').countDocuments({ sentAt: null }); } catch (e) {}
@@ -527,8 +601,7 @@ async function ensureIndexes() {
     await db.collection('telegram_outbox').createIndex({ sentAt: 1, createdAt: 1 });
     await db.collection('telegram_outbox').createIndex({ sentAt: 1 }, { expireAfterSeconds: 7 * 86400 });
     await db.collection('trades').createIndex({ configId: 1, status: 1 });
-    await db.collection('signal_history').createIndex({ createdAt: -1 });
-    await Log.ensureIndexes(db);
+    // ایندکس signal_history از قبل توسط ensureIndexes سراسری در db.js ساخته می‌شود
 }
 async function start() {
     await connectDB();
@@ -537,6 +610,7 @@ async function start() {
     Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
     await Options.ensureIndexes();
     await backfillDailyFromBase();
+    await persistTfCandles().catch(e => console.error('❌ persistTfCandles:', e.message));
     const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
     if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
     if (!ADMIN_TOKEN) console.warn('⚠️ ADMIN_TOKEN تنظیم نشده؛ مسیرهای تغییردهنده باز هستند.');
@@ -544,14 +618,24 @@ async function start() {
     cron.schedule('* * * * *', async () => {
         const t = getTehranParts();
         flushOutbox().catch(() => {});
-        if (!isMarketOpen(t) || holidayDate === todayDateString(t)) return;
+        if (!isMarketOpen(t)) return;
+        if (holidayDate === todayDateString(t)) {
+            if (t.minute % 5 !== 0) return;               // هر ۵ دقیقه یک بررسی مجدد
+            try {
+                const raw = await fetchAllSymbolsRaw();
+                if (raw.filter(s => +s.tno > 0).length >= 20) { holidayDate = null; inactiveTicks = 0; await getDB().collection('meta').deleteOne({ _id: 'holiday' }); await notify('🟢 بازار فعال شد؛ علامت تعطیلی برداشته شد.'); }
+                else return;
+            } catch (e) { return; }
+        }
         await tick();
     });
+    
     // ارزیابی پس از بسته شدن بازار (کندل ۱۱:۰۰ یک‌ساعته و کندل روزانه) + ذخیره‌ی پایان‌روز آپشن
     cron.schedule('32 12 * * 6,0,1,2,3', async () => {
         if (holidayDate === todayDateString(getTehranParts())) return;
         try {
             await evaluateAll(null);
+            await persistTfCandles();
             const monitored = await getDB().collection('monitored_symbols').find({}).toArray();
             const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
             const chain = await Options.fetchChain(0);
@@ -561,7 +645,7 @@ async function start() {
         } catch (e) { console.error('❌ ارزیابی پس از بسته شدن:', e.message); }
     }, { timezone: 'Asia/Tehran' });
     cron.schedule('35 12 * * 6,0,1,2,3', () => { if (holidayDate !== todayDateString(getTehranParts())) sendDailySummary().catch(() => {}); }, { timezone: 'Asia/Tehran' });
-
+    cron.schedule('0 10 * * 4', () => { sendWeeklyBackup().catch(e => console.error('❌ بکاپ هفتگی:', e.message)); }, { timezone: 'Asia/Tehran' });
     app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
     notify(`🚀 سرور ری‌استارت شد (${SERVER_VERSION})`).catch(() => {});
 }
