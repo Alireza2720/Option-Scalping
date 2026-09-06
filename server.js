@@ -115,6 +115,13 @@ app.get('/api/symbols/search', (req, res) => {
     const q = (req.query.q || '').trim(); if (!q) return res.json([]);
     res.json(symbolsCache.filter(s => s.symbol.includes(q) || (s.name && s.name.includes(q))).slice(0, 20));
 });
+// تیکر (فملی) در چین آپشن به‌صورت نام کامل شرکت ظاهر می‌شود؛ هر دو حالت را برای تطبیق برمی‌گردانیم
+function getUnderlyingNames(symbol) {
+    const names = new Set([Options.norm(symbol)]);
+    const found = symbolsCache.find(s => s.symbol === symbol);
+    if (found && found.name) names.add(Options.norm(found.name));
+    return Array.from(names);
+}
 
 // ---------------- تلگرام با صف ارسال (۱.۳) ----------------
 async function telegramSend(text) {
@@ -476,23 +483,36 @@ app.get('/api/trades', async (req, res, next) => {
     try { const trades = await getDB().collection('trades').find({}).sort({ entryTime: -1 }).limit(500).toArray(); res.json({ trades: trades.slice(0, 200), stats: computeStats(trades) }); } catch (e) { next(e); }
 });
 // بک‌تست روی کل داده‌ی موجود (کندل‌های بسته)
+async function computeStockBacktestTrades(cfg) {
+    const def = STRATEGIES[cfg.strategyId]; const htfTf = cfg.htfTimeframe || '1d';
+    const candles = closedOnly(await getCandlesFull(cfg.symbol, cfg.timeframe), cfg.timeframe);
+    const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
+    const result = def.run(candles, { ...cfg.params, candleType: cfg.candleType }, { htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
+    const closeAt = new Map(candles.map((c, i) => [c.time, { close: c.close, i }]));
+    const trades = []; let open = null;
+    for (const s of result.signals) {
+        const c = closeAt.get(s.time); if (!c) continue;
+        if (s.signalType === 'BUY' && !open) open = { entryTime: s.time, entryPrice: c.close, entryIdx: c.i, reason: s.reason, status: 'open' };
+        else if (s.signalType === 'EXIT_LONG' && open) { trades.push({ ...open, exitTime: s.time, exitPrice: c.close, pnlPct: (c.close / open.entryPrice - 1) * 100, bars: c.i - open.entryIdx, exitReason: s.reason, status: 'closed' }); open = null; }
+    }
+    if (open) trades.push(open);
+    return { candles, htf, trades };
+}
 app.get('/api/backtest/:configId', async (req, res, next) => {
     try {
         const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
         if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
-        const def = STRATEGIES[cfg.strategyId]; const htfTf = cfg.htfTimeframe || '1d';
-        const candles = closedOnly(await getCandlesFull(cfg.symbol, cfg.timeframe), cfg.timeframe);
-        const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
-        const result = def.run(candles, { ...cfg.params, candleType: cfg.candleType }, { htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
-        const closeAt = new Map(candles.map((c, i) => [c.time, { close: c.close, i }]));
-        const trades = []; let open = null;
-        for (const s of result.signals) {
-            const c = closeAt.get(s.time); if (!c) continue;
-            if (s.signalType === 'BUY' && !open) open = { entryTime: s.time, entryPrice: c.close, entryIdx: c.i, reason: s.reason, status: 'open' };
-            else if (s.signalType === 'EXIT_LONG' && open) { trades.push({ ...open, exitTime: s.time, exitPrice: c.close, pnlPct: (c.close / open.entryPrice - 1) * 100, bars: c.i - open.entryIdx, exitReason: s.reason, status: 'closed' }); open = null; }
-        }
-        if (open) trades.push(open);
+        const { candles, htf, trades } = await computeStockBacktestTrades(cfg);
         res.json({ candles: candles.length, htfCandles: htf.length, stats: computeStats(trades), trades: trades.slice(-100) });
+    } catch (e) { next(e); }
+});
+app.get('/api/backtest-option/:configId', async (req, res, next) => {
+    try {
+        const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
+        if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
+        const { trades } = await computeStockBacktestTrades(cfg);
+        const result = await Options.runApproxOptionBacktest(cfg.symbol, trades.filter(t => t.status === 'closed'));
+        res.json({ stockTradesCount: trades.length, ...result });
     } catch (e) { next(e); }
 });
 

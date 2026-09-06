@@ -123,7 +123,8 @@ function breakevenMove(S, K, T2, sig, cost, halfSpread) {
     return ((lo + hi) / 2 / S - 1) * 100;
 }
 function selectCalls(chain, underlying, sc, s) {
-    const cands = chain.filter(c => c.isCall && c.underlying === underlying);
+    const names = Array.isArray(underlying) ? underlying : [underlying];
+    const cands = chain.filter(c => c.isCall && names.includes(c.underlying));
     const rejected = {}, scored = [];
     for (const c of cands) {
         const S = sc.S || c.S, m = metrics(c, S, sc.hv);
@@ -175,12 +176,13 @@ function formatRecommendation(symbol, sc, res, title = '🎯 انتخاب قرا
 async function onBuySignal({ config, indicators, price, liveS, tradeId }) {
     const s = await getSettings(), chain = await fetchChain(60000);
     const sc = await buildScenario(config, price, liveS, indicators, s);
-    const res = selectCalls(chain, norm(config.symbol), sc, s);
+    const names = deps.getUnderlyingNames ? deps.getUnderlyingNames(config.symbol) : [norm(config.symbol)];
+    const res = selectCalls(chain, names, sc, s);
     await deps.notify(formatRecommendation(config.symbol, sc, res));
     if (res.picks.length) {
         const p = res.picks[0];
         await deps.getDB().collection('option_positions').insertOne({
-            configId: config._id.toString(), tradeId: tradeId ? tradeId.toString() : null, underlying: config.symbol, symbol: p.symbol, fullName: p.fullName,
+            configId: config._id.toString(), tradeId: tradeId ? tradeId.toString() : null, underlying: config.symbol, underlyingNames: names, symbol: p.symbol, fullName: p.fullName,
             strike: p.strike, expiry: p.expiry, entryTime: new Date(), entryAsk: p.ask, entryBid: p.bid, entryS: p.S, entryIv: p.iv, entryDelta: p.delta,
             entryDaysLeft: p.daysLeft, size: p.size, scenario: sc, paper: true, status: 'open'
         });
@@ -190,7 +192,8 @@ async function onBuySignal({ config, indicators, price, liveS, tradeId }) {
 async function recommendForState(config, state) {
     const s = await getSettings(), chain = await fetchChain(60000);
     const sc = await buildScenario(config, state.price, state.livePrice, state.indicators, s);
-    return { scenario: sc, ...selectCalls(chain, norm(config.symbol), sc, s) };
+    const names = deps.getUnderlyingNames ? deps.getUnderlyingNames(config.symbol) : [norm(config.symbol)];
+    return { scenario: sc, ...selectCalls(chain, names, sc, s) };
 }
 
 // ---------------- مدیریت موقعیت‌های باز ----------------
@@ -221,7 +224,8 @@ async function managePositions(chain) {
             Object.assign(upd, { status: 'closed', exitTime: new Date(), exitBid: exitPx, exitS: c.S, pnlPct, exitReason: reason });
             let roll = '';
             if (longIds.has(p.configId) && c.daysLeft <= s.closeDaysBefore && p.scenario) {
-                const r = selectCalls(chain, norm(p.underlying), { ...p.scenario, S: c.S }, s);
+                const names = p.underlyingNames && p.underlyingNames.length ? p.underlyingNames : [norm(p.underlying)];
+                const r = selectCalls(chain, names, { ...p.scenario, S: c.S }, s);
                 if (r.picks.length) { const q = r.picks[0]; roll = `\n🔁 پیشنهاد رول: ${q.symbol} اعمال ${f0(q.strike)} سررسید ${q.expiry} (${q.daysLeft} روز) خرید ${f0(q.ask)} دلتا ${q.delta.toFixed(2)}`; }
             }
             await deps.notify(`🔔 بستن کال ${p.symbol} (${p.underlying})\nدلیل: ${reason}\nورود ${f0(p.entryAsk)} → خروج ${f0(exitPx)} | بازده ${pc(pnlPct)} (پس از کارمزد)\nسهم پایه: ${f0(p.entryS)} → ${f0(c.S)} (${pc((c.S / p.entryS - 1) * 100)})${roll}`);
@@ -273,6 +277,38 @@ function positionStats(list) {
     return { open: list.length - closed.length, closed: closed.length, winRate: closed.length ? wins.length / closed.length * 100 : 0, avgPnl: closed.length ? sum(closed) / closed.length : 0,
         totalPnl: sum(closed), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0), avgWin: wins.length ? gp / wins.length : 0, avgLoss: closed.length - wins.length ? -gl / (closed.length - wins.length) : 0 };
 }
+// ---------------- بک‌تست تقریبی آپشن (بلک‌شولز فرضی؛ داده‌ی واقعی قرارداد گذشته وجود ندارد) ----------------
+const OPT_BT_DEFAULTS = { assumedMaturityDays: 45, ivMultiplier: 1.2, spreadPct: 5 };
+function historicalHV(closes, uptoIndex, n = 20) {
+    const start = Math.max(0, uptoIndex - n), slice = closes.slice(start, uptoIndex + 1);
+    if (slice.length < 6) return null;
+    const rets = []; for (let i = 1; i < slice.length; i++) rets.push(Math.log(slice[i] / slice[i - 1]));
+    const m = rets.reduce((a, b) => a + b, 0) / rets.length, v = rets.reduce((a, b) => a + (b - m) ** 2, 0) / (rets.length - 1);
+    return Math.sqrt(v * TRADING_DAYS);
+}
+async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
+    const p = { ...OPT_BT_DEFAULTS, ...opts };
+    const daily = await deps.getDB().collection('candles_daily').find({ symbol }).sort({ time: 1 }).toArray();
+    const closes = daily.map(r => r.close), times = daily.map(r => Math.floor(new Date(r.time).getTime() / 1000));
+    const trades = [];
+    for (const t of closedTrades) {
+        let idx = -1; for (let i = 0; i < times.length; i++) { if (times[i] <= t.entryTime) idx = i; else break; }
+        const hv = (idx >= 0 ? historicalHV(closes, idx) : null) || 0.4, sigma = hv * p.ivMultiplier;
+        const daysHeld = Math.max((t.exitTime - t.entryTime) / 86400, 0.1);
+        const Tentry = p.assumedMaturityDays / 365, Texit = Math.max(p.assumedMaturityDays - daysHeld, 0.5) / 365;
+        const strike = Math.round(t.entryPrice);
+        const entryTheo = bsCall(t.entryPrice, strike, Tentry, RISK_FREE, sigma), exitTheo = bsCall(t.exitPrice, strike, Texit, RISK_FREE, sigma);
+        const halfSpread = p.spreadPct / 200;
+        const entryCost = entryTheo.price * (1 + halfSpread) * (1 + FEE_BUY), exitProceeds = exitTheo.price * (1 - halfSpread) * (1 - FEE_SELL);
+        if (!(entryCost > 0)) continue;
+        trades.push({ entryTime: t.entryTime, exitTime: t.exitTime, stockEntry: t.entryPrice, stockExit: t.exitPrice, strike, hv, entryDelta: entryTheo.delta,
+            optionEntry: entryTheo.price, optionExit: exitTheo.price, pnlPct: (exitProceeds / entryCost - 1) * 100, exitReason: t.exitReason });
+    }
+    const wins = trades.filter(x => x.pnlPct > 0), sum = a => a.reduce((s, x) => s + x.pnlPct, 0);
+    const gp = sum(wins), gl = -sum(trades.filter(x => x.pnlPct <= 0));
+    return { assumptions: p, stats: { count: trades.length, winRate: trades.length ? wins.length / trades.length * 100 : 0, avgPnl: trades.length ? sum(trades) / trades.length : 0,
+        totalPnl: sum(trades), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0) }, trades };
+}
 
 // ---------------- روت‌ها ----------------
 function registerRoutes(app, ObjectId) {
@@ -280,10 +316,20 @@ function registerRoutes(app, ObjectId) {
     app.put('/api/options/settings', async (req, res, next) => { try { res.json(await saveSettings(req.body || {})); } catch (e) { next(e); } });
     app.get('/api/options/chain/:underlying', async (req, res, next) => {
         try {
-            const s = await getSettings(), chain = await fetchChain(60000), u = norm(req.params.underlying), hv = await hvFromDaily(req.params.underlying);
-            const rows = chain.filter(c => c.isCall && c.underlying === u).map(c => { const m = metrics(c, c.S, hv); return { ...c, ...m, reject: rejectReasons(c, m, s) }; })
+            const s = await getSettings(), chain = await fetchChain(60000);
+            const names = deps.getUnderlyingNames ? deps.getUnderlyingNames(req.params.underlying) : [norm(req.params.underlying)];
+            const hv = await hvFromDaily(req.params.underlying);
+            const rows = chain.filter(c => c.isCall && names.includes(c.underlying)).map(c => { const m = metrics(c, c.S, hv); return { ...c, ...m, reject: rejectReasons(c, m, s) }; })
                 .sort((a, b) => a.expiry.localeCompare(b.expiry) || a.strike - b.strike);
-            res.json({ underlying: req.params.underlying, S: rows[0] ? rows[0].S : null, hv, chainAgeSec: chainAge(), rows });
+            res.json({ underlying: req.params.underlying, matchedNames: names, S: rows[0] ? rows[0].S : null, hv, chainAgeSec: chainAge(), rows });
+        } catch (e) { next(e); }
+    });
+    // ابزار عیب‌یابی: لیست همه‌ی نام‌های دارایی پایه‌ای که الان در بازار آپشن وجود دارند
+    app.get('/api/options/underlyings', async (req, res, next) => {
+        try {
+            const chain = await fetchChain(60000), map = new Map();
+            chain.filter(c => c.isCall).forEach(c => map.set(c.underlying, (map.get(c.underlying) || 0) + 1));
+            res.json({ count: map.size, underlyings: Array.from(map.entries()).map(([underlying, contracts]) => ({ underlying, contracts })).sort((a, b) => a.underlying.localeCompare(b.underlying)) });
         } catch (e) { next(e); }
     });
     app.get('/api/options/recommend/:configId', async (req, res, next) => {
@@ -302,4 +348,4 @@ function registerRoutes(app, ObjectId) {
     app.get('/api/storage', async (req, res, next) => { try { res.json(await storageStats()); } catch (e) { next(e); } });
 }
 
-module.exports = { init, norm, ensureIndexes, registerRoutes, fetchChain, storeSnapshots, storeEOD, managePositions, onBuySignal, openPositionsCount, storageStats, positionStats, getSettings };
+module.exports = { init, norm, ensureIndexes, registerRoutes, fetchChain, storeSnapshots, storeEOD, managePositions, onBuySignal, openPositionsCount, storageStats, positionStats, getSettings, runApproxOptionBacktest };
