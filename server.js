@@ -17,7 +17,7 @@ const STARTED_AT = new Date();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SERVER_VERSION = 'v5.0-closed-htf-secure';
-
+let holidayDate = null, inactiveTicks = 0;
 // ---------------- تنظیمات ----------------
 const API_KEYS = [process.env.BRSAPI_KEY_1 || process.env.BRSAPI_KEY, process.env.BRSAPI_KEY_2, process.env.BRSAPI_KEY_3].filter(Boolean);
 const PER_KEY_LIMIT = 90;
