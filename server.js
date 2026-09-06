@@ -167,7 +167,8 @@ async function sendDailySummary() {
         const sg = await Options.storageStats();
         const archLine = sg.archive && sg.archive.length ? ' | آرشیو: ' + sg.archive.map(a => a.mb !== null ? `${a.mb}MB` : 'خطا').join('، ') : '';
         storLine = `\nدیتابیس اصلی: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}${archLine}`;
-    } catch (e) {}    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
+    } catch (e) {}
+    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
 
 // ---------------- بکاپ هفتگی تنظیمات (Atlas رایگان بکاپ خودکار ندارد) ----------------
@@ -215,10 +216,12 @@ async function checkStorageAlert() {
 app.post('/api/archive/run', async (req, res, next) => { try { res.json({ success: true, result: await runArchiving() }); } catch (e) { next(e); } });
 app.get('/api/archive/status', async (req, res, next) => { try { res.json({ configured: Archive.hasArchive(), safetyMB: Archive.SAFETY_MB, archives: await Archive.allArchiveStats() }); } catch (e) { next(e); } });
 
-// ---------------- تعطیلی (۱.۷) ----------------async function markHoliday(t) {
+// ---------------- تعطیلی (۱.۷) ----------------
+async function markHoliday(t) {
     holidayDate = todayDateString(t);
     await getDB().collection('meta').updateOne({ _id: 'holiday' }, { $set: { date: holidayDate } }, { upsert: true });
     await notify(`📅 امروز (${holidayDate}) معامله‌ای در بازار دیده نشد؛ احتمالاً تعطیل است. پایش تا فردا متوقف شد.`);
+}
 
 // برداشتن دستی علامت تعطیلی (نیاز به توکن ادمین دارد چون DELETE است)
 app.delete('/api/holiday', async (req, res, next) => {
@@ -662,10 +665,12 @@ async function start() {
     await connectDB();
     Log.init(getDB);
     await ensureIndexes();
-Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()), archiveStats: Archive.allArchiveStats });    await Options.ensureIndexes();
+Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()), archiveStats: Archive.allArchiveStats });
+    await Options.ensureIndexes();
     await backfillDailyFromBase();
     await persistTfCandles().catch(e => console.error('❌ persistTfCandles:', e.message));
-    runArchiving().then(r => console.log('🗄 آرشیو اولیه:', JSON.stringify(r))).catch(e => console.error('❌ آرشیو اولیه ناموفق:', e.message));    const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
+    runArchiving().then(r => console.log('🗄 آرشیو اولیه:', JSON.stringify(r))).catch(e => console.error('❌ آرشیو اولیه ناموفق:', e.message));
+    const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
     if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
     if (!ADMIN_TOKEN) console.warn('⚠️ ADMIN_TOKEN تنظیم نشده؛ مسیرهای تغییردهنده باز هستند.');
 
@@ -703,7 +708,8 @@ Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayD
     cron.schedule('0 3 * * *', async () => {
         try { const r = await runArchiving(); console.log('🗄 آرشیو انجام شد:', JSON.stringify(r)); await checkStorageAlert(); }
         catch (e) { console.error('❌ آرشیو ناموفق:', e.message); }
-    }, { timezone: 'Asia/Tehran' });    app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
+    }, { timezone: 'Asia/Tehran' });
+    app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
     notify(`🚀 سرور ری‌استارت شد (${SERVER_VERSION})`).catch(() => {});
 }
 start().catch(e => { console.error('❌ راه‌اندازی:', e); process.exit(1); });
