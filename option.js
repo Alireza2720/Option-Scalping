@@ -250,20 +250,22 @@ async function storeEOD(chain, monitoredSet) {
     return n;
 }
 async function ensureIndexes() {
-    const db = deps.getDB(), s = await getSettings();
+    const db = deps.getDB();
     await db.collection('option_snapshots').createIndex({ symbol: 1, time: 1 });
+    // بدون TTL — داده‌ی قدیمی به‌جای حذف، توسط archive.js منتقل می‌شود (آستانه‌ی زمانی از snapshotTtlDays خوانده می‌شود)
     try { await db.collection('option_snapshots').dropIndex('time_1'); } catch (e) {}
-    await db.collection('option_snapshots').createIndex({ time: 1 }, { expireAfterSeconds: s.snapshotTtlDays * 86400 });
+    await db.collection('option_snapshots').createIndex({ time: 1 });
     await db.collection('option_daily').createIndex({ symbol: 1, date: 1 }, { unique: true });
     await db.collection('option_daily').createIndex({ underlying: 1, date: 1 });
     await db.collection('option_positions').createIndex({ status: 1, configId: 1 });
 }
 async function storageStats() {
     const db = deps.getDB(), st = await db.stats();
-    const names = ['candles_base', 'candles_daily', 'option_snapshots', 'option_daily', 'option_positions', 'signal_history', 'trades', 'telegram_outbox'];
+    const names = ['candles_base', 'candles_daily', 'candles_tf', 'option_snapshots', 'option_daily', 'option_positions', 'signal_history', 'trades', 'telegram_outbox', 'logs'];
     const cols = [];
     for (const n of names) { try { const c = await db.command({ collStats: n }); cols.push({ name: n, count: c.count, sizeMB: +(c.size / 1048576).toFixed(2), storageMB: +((c.storageSize + c.totalIndexSize) / 1048576).toFixed(2) }); } catch (e) {} }
-    return { dataMB: +(st.dataSize / 1048576).toFixed(1), storageMB: +((st.storageSize + st.indexSize) / 1048576).toFixed(1), limitMB: 512, cols };
+    const archive = deps.archiveStats ? await deps.archiveStats() : [];
+    return { dataMB: +(st.dataSize / 1048576).toFixed(1), storageMB: +((st.storageSize + st.indexSize) / 1048576).toFixed(1), limitMB: 512, cols, archive };
 }
 function positionStats(list) {
     const closed = list.filter(p => p.status === 'closed' && typeof p.pnlPct === 'number'), wins = closed.filter(p => p.pnlPct > 0);

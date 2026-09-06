@@ -10,6 +10,7 @@ const Strat = require('./strategies.js');
 const { STRATEGIES, aggregateCandles, getRequiredCandles } = Strat;
 const Options = require('./option.js');
 const Log = require('./log.js');
+const Archive = require('./archive.js');
 Log.patchConsole();
 const STARTED_AT = new Date();
 
@@ -156,8 +157,11 @@ async function sendDailySummary() {
     const openTrades = await getDB().collection('trades').countDocuments({ status: 'open' });
     let optLine = '', storLine = '';
     try { const list = await getDB().collection('option_positions').find({}).toArray(); const s = Options.positionStats(list); optLine = `\nآپشن: باز ${s.open} | بسته ${s.closed} | وین‌ریت ${s.winRate.toFixed(0)}٪ | بازده کل ${s.totalPnl.toFixed(0)}٪`; } catch (e) {}
-    try { const sg = await Options.storageStats(); storLine = `\nدیتابیس: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}`; } catch (e) {}
-    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
+    try {
+        const sg = await Options.storageStats();
+        const archLine = sg.archive && sg.archive.length ? ' | آرشیو: ' + sg.archive.map(a => a.mb !== null ? `${a.mb}MB` : 'خطا').join('، ') : '';
+        storLine = `\nدیتابیس اصلی: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}${archLine}`;
+    } catch (e) {}    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
 
 // ---------------- بکاپ هفتگی تنظیمات (Atlas رایگان بکاپ خودکار ندارد) ----------------
@@ -182,8 +186,30 @@ async function sendWeeklyBackup() {
 }
 app.post('/api/backup/run', async (req, res, next) => { try { await sendWeeklyBackup(); res.json({ success: true }); } catch (e) { next(e); } });
 
-// ---------------- تعطیلی (۱.۷) ----------------let holidayDate = null, inactiveTicks = 0;
-async function markHoliday(t) {
+// ---------------- آرشیو (به‌جای حذف داده‌های قدیمی) ----------------
+async function runArchiving() {
+    if (!Archive.hasArchive()) return { skipped: 'no-archive-configured' };
+    const db = getDB(), now = Date.now(), results = {};
+    results.candles_base = await Archive.moveOldDocs(db, 'candles_base', 'time', new Date(now - 45 * 86400000));
+    const optSettings = await Options.getSettings();
+    results.option_snapshots = await Archive.moveOldDocs(db, 'option_snapshots', 'time', new Date(now - optSettings.snapshotTtlDays * 86400000));
+    results.telegram_outbox = await Archive.moveOldDocs(db, 'telegram_outbox', 'createdAt', new Date(now - 14 * 86400000));
+    results.logs = await Archive.moveOldDocs(db, 'logs', 'at', new Date(now - 14 * 86400000));
+    return results;
+}
+async function checkStorageAlert() {
+    try {
+        const sg = await Options.storageStats();
+        if (sg.storageMB <= 430) return;
+        if (!Archive.hasArchive()) { await notify(`🔴 دیتابیس اصلی ${sg.storageMB}/${sg.limitMB} MB — نزدیک پر شدن!\nیک اکانت رایگان MongoDB Atlas جدید بساز و آدرس اتصالش را در Render با نام MONGO_URI_ARCHIVE_1 اضافه کن.`); return; }
+        const target = await Archive.pickArchiveDB();
+        if (!target) await notify(`🔴 دیتابیس اصلی ${sg.storageMB} MB و همه‌ی دیتابیس‌های آرشیو هم پر شده‌اند!\nیک اکانت Atlas جدید بساز و متغیر MONGO_URI_ARCHIVE_${(process.env.MONGO_URI_ARCHIVE_5?6:process.env.MONGO_URI_ARCHIVE_4?5:process.env.MONGO_URI_ARCHIVE_3?4:process.env.MONGO_URI_ARCHIVE_2?3:2)} را در Render اضافه کن.`);
+    } catch (e) { console.error('❌ بررسی فضای دیتابیس:', e.message); }
+}
+app.post('/api/archive/run', async (req, res, next) => { try { res.json({ success: true, result: await runArchiving() }); } catch (e) { next(e); } });
+app.get('/api/archive/status', async (req, res, next) => { try { res.json({ configured: Archive.hasArchive(), safetyMB: Archive.SAFETY_MB, archives: await Archive.allArchiveStats() }); } catch (e) { next(e); } });
+
+// ---------------- تعطیلی (۱.۷) ----------------async function markHoliday(t) {
     holidayDate = todayDateString(t);
     await getDB().collection('meta').updateOne({ _id: 'holiday' }, { $set: { date: holidayDate } }, { upsert: true });
     await notify(`📅 امروز (${holidayDate}) معامله‌ای در بازار دیده نشد؛ احتمالاً تعطیل است. پایش تا فردا متوقف شد.`);
@@ -217,17 +243,35 @@ function mergeSessionTail(candles, tfMin) {
     }
     return out;
 }
+function buildTfCandles(permanentRows, baseCandles, tfMin) {
+    const live = mergeSessionTail(aggregateCandles(baseCandles, tfMin), tfMin);
+    const map = new Map(permanentRows.map(c => [Math.floor(c.time.getTime() / 1000), { time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete }]));
+    for (const c of live) map.set(c.time, c); // داده‌ی زنده (دقیق‌تر برای روزهای اخیر) جایگزین می‌شود
+    return Array.from(map.values()).sort((a, b) => a.time - b.time);
+}
+// سریع — فقط دیتابیس اصلی؛ در مسیر تیک هر‌دقیقه‌ای استفاده می‌شود
 async function getCandles(symbol, tf) {
     if (tf === '1d') {
         const d = await getDB().collection('candles_daily').find({ symbol }).sort({ time: 1 }).toArray();
         return d.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 }));
     }
-    // کندل‌های دائمی (روزهای قدیمی‌تر از پنجره‌ی ۴۵ روزه) + کندل‌های زنده (تازه‌تر، از داده‌ی پایه)
     const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
-    const live = mergeSessionTail(aggregateCandles(await getBaseCandles(symbol), TF[tf]), TF[tf]);
-    const map = new Map(permanent.map(c => [Math.floor(c.time.getTime() / 1000), { time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete }]));
-    for (const c of live) map.set(c.time, c); // داده‌ی زنده (دقیق‌تر برای روزهای اخیر) جایگزین می‌شود
+    return buildTfCandles(permanent, await getBaseCandles(symbol), TF[tf]);
+}
+// کامل — دیتابیس اصلی + آرشیو؛ فقط برای نمودار و بک‌تست (کندتر، ولی همیشه تاریخچه‌ی کامل)
+async function getBaseCandlesWithArchive(symbol) {
+    const primary = await getBaseCandles(symbol);
+    if (!Archive.hasArchive()) return primary;
+    const archived = await Archive.getArchivedBaseCandles(symbol).catch(e => { console.error('❌ خواندن آرشیو کندل:', e.message); return []; });
+    if (!archived.length) return primary;
+    const map = new Map(archived.map(c => [c.time, c]));
+    primary.forEach(c => map.set(c.time, c)); // در صورت تداخل، نسخه‌ی دیتابیس اصلی اولویت دارد
     return Array.from(map.values()).sort((a, b) => a.time - b.time);
+}
+async function getCandlesFull(symbol, tf) {
+    if (tf === '1d' || !Archive.hasArchive()) return getCandles(symbol, tf);
+    const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
+    return buildTfCandles(permanent, await getBaseCandlesWithArchive(symbol), TF[tf]);
 }
 async function activeConfigTimeframes() {
     const configs = await getDB().collection('strategy_configs').find({}).toArray();
@@ -295,8 +339,8 @@ app.get('/api/chart-data/:configId', async (req, res, next) => {
         const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
         if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
         const htfTf = cfg.htfTimeframe || '1d';
-        const candles = await getCandles(cfg.symbol, cfg.timeframe);
-        const htf = closedOnly(await getCandles(cfg.symbol, htfTf), htfTf);
+        const candles = await getCandlesFull(cfg.symbol, cfg.timeframe);
+        const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
         res.json({ config: cfg, candles, closedCount: closedOnly(candles, cfg.timeframe).length, htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
     } catch (e) { next(e); }
 });
@@ -425,8 +469,8 @@ app.get('/api/backtest/:configId', async (req, res, next) => {
         const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
         if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
         const def = STRATEGIES[cfg.strategyId]; const htfTf = cfg.htfTimeframe || '1d';
-        const candles = closedOnly(await getCandles(cfg.symbol, cfg.timeframe), cfg.timeframe);
-        const htf = closedOnly(await getCandles(cfg.symbol, htfTf), htfTf);
+        const candles = closedOnly(await getCandlesFull(cfg.symbol, cfg.timeframe), cfg.timeframe);
+        const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
         const result = def.run(candles, { ...cfg.params, candleType: cfg.candleType }, { htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
         const closeAt = new Map(candles.map((c, i) => [c.time, { close: c.close, i }]));
         const trades = []; let open = null;
@@ -599,19 +643,20 @@ async function ensureIndexes() {
     const db = getDB();
     await db.collection('candles_daily').createIndex({ symbol: 1, time: 1 }, { unique: true });
     await db.collection('telegram_outbox').createIndex({ sentAt: 1, createdAt: 1 });
-    await db.collection('telegram_outbox').createIndex({ sentAt: 1 }, { expireAfterSeconds: 7 * 86400 });
+    // بدون TTL — پیام‌های قدیمی به‌جای حذف، توسط archive.js منتقل می‌شوند
+    try { await db.collection('telegram_outbox').dropIndex('sentAt_1'); } catch (e) {}
+    try { await db.collection('telegram_outbox').dropIndex('createdAt_1'); } catch (e) {}
     await db.collection('trades').createIndex({ configId: 1, status: 1 });
-    // ایندکس signal_history از قبل توسط ensureIndexes سراسری در db.js ساخته می‌شود
+    await Log.ensureIndexes(db);
 }
 async function start() {
     await connectDB();
     Log.init(getDB);
     await ensureIndexes();
-    Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()) });
-    await Options.ensureIndexes();
+Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()), archiveStats: Archive.allArchiveStats });    await Options.ensureIndexes();
     await backfillDailyFromBase();
     await persistTfCandles().catch(e => console.error('❌ persistTfCandles:', e.message));
-    const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
+    runArchiving().then(r => console.log('🗄 آرشیو اولیه:', JSON.stringify(r))).catch(e => console.error('❌ آرشیو اولیه ناموفق:', e.message));    const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
     if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
     if (!ADMIN_TOKEN) console.warn('⚠️ ADMIN_TOKEN تنظیم نشده؛ مسیرهای تغییردهنده باز هستند.');
 
@@ -646,7 +691,10 @@ async function start() {
     }, { timezone: 'Asia/Tehran' });
     cron.schedule('35 12 * * 6,0,1,2,3', () => { if (holidayDate !== todayDateString(getTehranParts())) sendDailySummary().catch(() => {}); }, { timezone: 'Asia/Tehran' });
     cron.schedule('0 10 * * 4', () => { sendWeeklyBackup().catch(e => console.error('❌ بکاپ هفتگی:', e.message)); }, { timezone: 'Asia/Tehran' });
-    app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
+    cron.schedule('0 3 * * *', async () => {
+        try { const r = await runArchiving(); console.log('🗄 آرشیو انجام شد:', JSON.stringify(r)); await checkStorageAlert(); }
+        catch (e) { console.error('❌ آرشیو ناموفق:', e.message); }
+    }, { timezone: 'Asia/Tehran' });    app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
     notify(`🚀 سرور ری‌استارت شد (${SERVER_VERSION})`).catch(() => {});
 }
 start().catch(e => { console.error('❌ راه‌اندازی:', e); process.exit(1); });

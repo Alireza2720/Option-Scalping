@@ -37,7 +37,9 @@ function patchConsole() {
 }
 
 async function ensureIndexes(db) {
-    await db.collection('logs').createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 });
+    // بدون TTL — لاگ‌های قدیمی به‌جای حذف، توسط archive.js منتقل می‌شوند
+    try { await db.collection('logs').dropIndex('at_1'); } catch (e) {}
+    await db.collection('logs').createIndex({ at: 1 });
     await db.collection('logs').createIndex({ level: 1, at: -1 });
 }
 

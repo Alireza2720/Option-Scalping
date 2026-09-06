@@ -19,12 +19,10 @@ async function connectDB() {
 }
 
 async function ensureIndexes(database) {
-    const FORTY_FIVE_DAYS = 45 * 24 * 60 * 60;
-
-    // کندل‌های پایه‌ی ۱ دقیقه‌ای (۴۵ روز)
-    await database.collection('candles_base').createIndex({ time: 1 }, { expireAfterSeconds: FORTY_FIVE_DAYS });
+    // کندل‌های پایه‌ی ۱ دقیقه‌ای — بدون TTL؛ داده‌ی قدیمی به‌جای حذف، توسط archive.js منتقل می‌شود
+    try { await database.collection('candles_base').dropIndex('time_1'); } catch (e) { /* از قبل TTL نداشته یا وجود ندارد */ }
+    await database.collection('candles_base').createIndex({ time: 1 });
     await database.collection('candles_base').createIndex({ symbol: 1, time: 1 }, { unique: true });
-
     await database.collection('signal_history').createIndex({ createdAt: -1 });
     await database.collection('signals_state').createIndex({ configId: 1 }, { unique: true });
     await database.collection('notify_queue').createIndex({ createdAt: 1 });
