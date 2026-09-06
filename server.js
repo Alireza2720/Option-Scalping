@@ -21,6 +21,7 @@ let holidayDate = null, inactiveTicks = 0;
 // ---------------- تنظیمات ----------------
 const API_KEYS = [process.env.BRSAPI_KEY_1 || process.env.BRSAPI_KEY, process.env.BRSAPI_KEY_2, process.env.BRSAPI_KEY_3].filter(Boolean);
 const PER_KEY_LIMIT = 90;
+const HISTORY_PER_KEY_LIMIT = 10; // سهمیه‌ی جداگانه‌ی وب‌سرویس History (دیتای روزانه)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -62,25 +63,30 @@ const isMarketOpen = t => isTradingDay(t) && minuteOfDay(t) >= SESSION_START && 
 function getBucketTime(t, size) { const b = Math.floor(minuteOfDay(t) / size) * size; return tehranPartsToUTCDate(t.year, t.month, t.day, Math.floor(b / 60), b % 60); }
 const dayStartUTC = t => tehranPartsToUTCDate(t.year, t.month, t.day, 0, 0);
 
-// ---------------- سهمیه‌ی کلیدها ----------------
-const usageId = i => `allsymbols_usage_key${i + 1}`;
-async function getKeyUsage(i) {
+// ---------------- سهمیه‌ی کلیدها (چند نوع سهمیه: AllSymbols و History) ----------------
+const usageId = (i, prefix = 'allsymbols') => `${prefix}_usage_key${i + 1}`;
+async function getKeyUsage(i, prefix = 'allsymbols') {
     const db = getDB(), today = todayDateString(getTehranParts());
-    let doc = await db.collection('meta').findOne({ _id: usageId(i) });
-    if (!doc || doc.date !== today) { await db.collection('meta').updateOne({ _id: usageId(i) }, { $set: { date: today, count: 0 } }, { upsert: true }); doc = { date: today, count: 0 }; }
+    let doc = await db.collection('meta').findOne({ _id: usageId(i, prefix) });
+    if (!doc || doc.date !== today) { await db.collection('meta').updateOne({ _id: usageId(i, prefix) }, { $set: { date: today, count: 0 } }, { upsert: true }); doc = { date: today, count: 0 }; }
     return doc;
 }
-async function acquireApiKey() {
+async function acquireApiKey(prefix = 'allsymbols', limit = PER_KEY_LIMIT) {
     for (let i = 0; i < API_KEYS.length; i++) {
-        const u = await getKeyUsage(i);
-        if (u.count < PER_KEY_LIMIT) { await getDB().collection('meta').updateOne({ _id: usageId(i) }, { $inc: { count: 1 } }); return { key: API_KEYS[i], index: i }; }
+        const u = await getKeyUsage(i, prefix);
+        if (u.count < limit) { await getDB().collection('meta').updateOne({ _id: usageId(i, prefix) }, { $inc: { count: 1 } }); return { key: API_KEYS[i], index: i }; }
     }
     return null;
 }
 async function getAllUsage() {
     const keys = [];
     for (let i = 0; i < API_KEYS.length; i++) { const u = await getKeyUsage(i); keys.push({ index: i + 1, count: u.count, limit: PER_KEY_LIMIT }); }
-    return { date: todayDateString(getTehranParts()), keys, total: keys.reduce((s, k) => s + k.count, 0), totalLimit: API_KEYS.length * PER_KEY_LIMIT };
+    const hist = [];
+    for (let i = 0; i < API_KEYS.length; i++) { const u = await getKeyUsage(i, 'history'); hist.push({ index: i + 1, count: u.count, limit: HISTORY_PER_KEY_LIMIT }); }
+    return {
+        date: todayDateString(getTehranParts()), keys, total: keys.reduce((s, k) => s + k.count, 0), totalLimit: API_KEYS.length * PER_KEY_LIMIT,
+        history: { keys: hist, total: hist.reduce((s, k) => s + k.count, 0), totalLimit: API_KEYS.length * HISTORY_PER_KEY_LIMIT }
+    };
 }
 app.get('/api/usage', async (req, res, next) => { try { res.json(await getAllUsage()); } catch (e) { next(e); } });
 
@@ -213,7 +219,7 @@ app.get('/api/archive/status', async (req, res, next) => { try { res.json({ conf
     holidayDate = todayDateString(t);
     await getDB().collection('meta').updateOne({ _id: 'holiday' }, { $set: { date: holidayDate } }, { upsert: true });
     await notify(`📅 امروز (${holidayDate}) معامله‌ای در بازار دیده نشد؛ احتمالاً تعطیل است. پایش تا فردا متوقف شد.`);
-}
+
 // برداشتن دستی علامت تعطیلی (نیاز به توکن ادمین دارد چون DELETE است)
 app.delete('/api/holiday', async (req, res, next) => {
     try { holidayDate = null; inactiveTicks = 0; await getDB().collection('meta').deleteOne({ _id: 'holiday' }); res.json({ success: true }); } catch (e) { next(e); }
@@ -345,44 +351,47 @@ app.get('/api/chart-data/:configId', async (req, res, next) => {
     } catch (e) { next(e); }
 });
 
-// ---------------- وارد کردن تاریخچه‌ی روزانه (TSETMC یا فایل CSV) ----------------
-// فرمت خروجی TSETMC: <TICKER>,<DTYYYYMMDD>,<FIRST>,<HIGH>,<LOW>,<CLOSE>,<VALUE>,<VOL>,<OPENINT>,<PER>,<OPEN>,<LAST>
-function parseTsetmcLines(text) {
-    return String(text || '').replace(/\r/g, '').split('\n').filter(l => /^[^,]+,\d{8},/.test(l)).map(l => l.split(','));
+// ---------------- وارد کردن تاریخچه‌ی روزانه از BrsApi History (سهمیه‌ی ۱۰ در روز به‌ازای هر کلید) ----------------
+// تبدیل تاریخ شمسی (مثل 1403-08-08) به میلادی — بدون نیاز به پکیج جانبی
+function jalaliToGregorian(jy, jm, jd) {
+    let gy; jy += 1595;
+    let days = -355668 + (365 * jy) + (Math.floor(jy / 33) * 8) + Math.floor(((jy % 33) + 3) / 4) + jd + ((jm < 7) ? (jm - 1) * 31 : ((jm - 7) * 30) + 186);
+    gy = 400 * Math.floor(days / 146097); days %= 146097;
+    if (days > 36524) { gy += 100 * Math.floor(--days / 36524); days %= 36524; if (days >= 365) days++; }
+    gy += 4 * Math.floor(days / 1461); days %= 1461;
+    if (days > 365) { gy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
+    let gd = days + 1;
+    const sal_a = [0, 31, ((gy % 4 === 0 && gy % 100 !== 0) || (gy % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let gm; for (gm = 0; gm < 13; gm++) { const v = sal_a[gm]; if (gd <= v) break; gd -= v; }
+    return { gy, gm, gd };
 }
-async function upsertDailyRows(symbol, rows) {
-    const col = getDB().collection('candles_daily'); let added = 0;
-    for (const f of rows) {
-        if (f.length < 12) continue;
-        const ds = f[1].trim(), time = tehranPartsToUTCDate(+ds.slice(0, 4), +ds.slice(4, 6), +ds.slice(6, 8), 0, 0);
-        const doc = { symbol, time, open: +f[2], high: +f[3], low: +f[4], close: +f[11] || +f[5], volume: +f[7] || 0, source: 'tsetmc' };
-        if (!(doc.close > 0)) continue;
-        const r = await col.updateOne({ symbol, time }, { $setOnInsert: doc }, { upsert: true });
-        if (r.upsertedCount) added++;
-    }
-    return { added, total: rows.length };
+function parseJalaliDate(s) {
+    const [jy, jm, jd] = String(s || '').split('-').map(Number);
+    if (!jy || !jm || !jd) return null;
+    const { gy, gm, gd } = jalaliToGregorian(jy, jm, jd);
+    return tehranPartsToUTCDate(gy, gm, gd, 0, 0);
 }
 async function importDailyHistory(symbol) {
-    const opts = { headers: { 'User-Agent': USER_AGENT }, timeout: 20000 };
-    const sr = await fetch(`http://old.tsetmc.com/tsev2/data/search.aspx?skey=${encodeURIComponent(symbol)}`, opts);
-    if (!sr.ok) throw new Error(`TSETMC search HTTP ${sr.status} (IP سرور مسدود است؛ از گزینه‌ی 📄 آپلود فایل استفاده کنید)`);
-    const rows = (await sr.text()).split(';').map(r => r.split(',')).filter(r => r.length > 3);
-    const hit = rows.find(r => r[0].trim() === symbol) || rows[0];
-    if (!hit) throw new Error('نماد در TSETMC پیدا نشد');
-    const ex = await fetch(`http://old.tsetmc.com/tsev2/data/Export-txt.aspx?t=i&a=1&b=0&i=${hit[2]}`, opts);
-    if (!ex.ok) throw new Error(`TSETMC export HTTP ${ex.status}`);
-    return upsertDailyRows(symbol, parseTsetmcLines(await ex.text()));
+    if (!API_KEYS.length) throw new Error('هیچ کلید BrsApi تنظیم نشده است.');
+    const picked = await acquireApiKey('history', HISTORY_PER_KEY_LIMIT);
+    if (!picked) throw new Error('سهمیه‌ی روزانه‌ی دیتای تاریخی (۱۰ درخواست به‌ازای هر کلید) تمام شده است؛ فردا دوباره امتحان کنید.');
+    const r = await fetch(`https://Api.BrsApi.ir/Tsetmc/History.php?key=${picked.key}&type=0&l18=${encodeURIComponent(symbol)}`, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, timeout: 20000 });
+    if (!r.ok) throw new Error(`HTTP ${r.status} (کلید ${picked.index + 1})`);
+    const data = await r.json();
+    if (!Array.isArray(data) || !data.length) throw new Error('داده‌ای برای این نماد یافت نشد (نام نماد را بررسی کنید)');
+    const col = getDB().collection('candles_daily'); let added = 0;
+    for (const row of data) {
+        const time = parseJalaliDate(row.date); if (!time) continue;
+        const close = +row.pl || +row.pc || 0; if (!(close > 0)) continue;
+        const doc = { symbol, time, open: +row.pf || close, high: +row.pmax || close, low: +row.pmin || close, close, volume: +row.tvol || 0, source: 'brsapi-history' };
+        const res = await col.updateOne({ symbol, time }, { $setOnInsert: doc }, { upsert: true });
+        if (res.upsertedCount) added++;
+    }
+    return { added, total: data.length };
 }
 app.post('/api/import-daily/:symbol', async (req, res) => {
     try { res.json({ success: true, ...(await importDailyHistory(req.params.symbol)) }); }
     catch (e) { console.error('❌ import-daily:', e.message); res.status(400).json({ error: e.message }); }
-});
-app.post('/api/import-daily-text/:symbol', async (req, res) => {
-    try {
-        const rows = parseTsetmcLines(req.body && req.body.text);
-        if (!rows.length) return res.status(400).json({ error: 'هیچ سطر معتبری در فایل پیدا نشد (فرمت باید خروجی «سابقه» TSETMC باشد)' });
-        res.json({ success: true, ...(await upsertDailyRows(req.params.symbol, rows)) });
-    } catch (e) { console.error('❌ import-daily-text:', e.message); res.status(400).json({ error: e.message }); }
 });
 
 // ---------------- نمادهای زیر نظر ----------------
