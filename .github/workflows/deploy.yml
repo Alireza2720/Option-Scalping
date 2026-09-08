@@ -1,8 +1,10 @@
 name: Deploy to VPS
+
 on:
   push:
     branches:
       - main
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -15,9 +17,10 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
           script: |
+            set -e
             cd ~/apps/Option-Scalping
             git pull origin main
-            npm install
-            sudo cp frontend/index.html /var/www/optionhunter/
-            sudo chown www-data:www-data /var/www/optionhunter/index.html
-            pm2 restart option-scalping
+            npm install --prefix backend
+            cd backend
+            pm2 restart ecosystem.config.js --update-env
+            pm2 save
