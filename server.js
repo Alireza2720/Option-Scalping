@@ -15,6 +15,7 @@ Log.patchConsole();
 const STARTED_AT = new Date();
 
 const app = express();
+app.disable('x-powered-by');
 const PORT = process.env.PORT || 3000;
 const SERVER_VERSION = 'v5.0-closed-htf-secure';
 let holidayDate = null, inactiveTicks = 0;
