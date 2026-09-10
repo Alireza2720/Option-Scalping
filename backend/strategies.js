@@ -424,25 +424,25 @@
     // ---------------- تعریف استراتژی‌ها ----------------
     const STRATEGIES = {
         rsi50_2: {
-            id: 'rsi50_2', name: 'پولبک RSI در روند', defaultTimeframe: '30m', htfTimeframe: '1d',
+            id: 'rsi50_2', name: 'RSI', defaultTimeframe: '30m', htfTimeframe: '1d',
             defaultParams: RSI_DEFAULTS,
             indicators: { overlay: [], panel: ['rsiFast', 'rsiSlow'] },
             run: runRSIPullback
         },
         ema_heikin: {
-            id: 'ema_heikin', name: 'پولبک EMA 25/50/100', defaultTimeframe: '15m', htfTimeframe: '1d',
+            id: 'ema_heikin', name: 'EMA', defaultTimeframe: '15m', htfTimeframe: '1d',
             defaultParams: EMA_DEFAULTS,
             indicators: { overlay: ['emaFast', 'emaMid', 'emaSlow'], panel: [] },
             run: runEMAPullback
         },
         macd_momentum: {
-            id: 'macd_momentum', name: 'مومنتوم MACD', defaultTimeframe: '15m', htfTimeframe: '1d',
+            id: 'macd_momentum', name: 'MACD', defaultTimeframe: '15m', htfTimeframe: '1d',
             defaultParams: MACD_DEFAULTS,
             indicators: { overlay: [], panel: ['macd', 'signal', 'hist'] },
             run: runMACDMomentum
         },
         ichimoku_cloud: {
-            id: 'ichimoku_cloud', name: 'ابر ایچیموکو', defaultTimeframe: '30m', htfTimeframe: '1d',
+            id: 'ichimoku_cloud', name: 'Ichimoku', defaultTimeframe: '30m', htfTimeframe: '1d',
             defaultParams: ICHIMOKU_DEFAULTS,
             indicators: { overlay: ['tenkan', 'kijun'], panel: [] },
             run: runIchimoku

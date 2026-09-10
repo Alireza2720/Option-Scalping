@@ -191,8 +191,7 @@ async function sendDailySummary() {
     try { const list = await getDB().collection('option_positions').find({}).toArray(); const s = Options.positionStats(list); optLine = `\nآپشن: باز ${s.open} | بسته ${s.closed} | وین‌ریت ${s.winRate.toFixed(0)}٪ | بازده کل ${s.totalPnl.toFixed(0)}٪`; } catch (e) {}
     try {
         const sg = await Options.storageStats();
-        const archLine = sg.archive && sg.archive.length ? ' | آرشیو: ' + sg.archive.map(a => a.mb !== null ? `${a.mb}MB` : 'خطا').join('، ') : '';
-        storLine = `\nدیتابیس اصلی: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}${archLine}`;
+        storLine = `\nدیتابیس اصلی: ${sg.storageMB} MB`;
     } catch (e) {}
     await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
@@ -218,29 +217,6 @@ async function sendWeeklyBackup() {
     await telegramSendBackup(`backup_${todayDateString(getTehranParts())}.json`, { exportedAt: new Date(), monitoredSymbols: symbols, strategyConfigs: configs, optionSettings: optSettings || null });
 }
 app.post('/api/backup/run', async (req, res, next) => { try { await sendWeeklyBackup(); res.json({ success: true }); } catch (e) { next(e); } });
-
-// ---------------- آرشیو (به‌جای حذف داده‌های قدیمی) ----------------
-async function runArchiving() {
-    if (!Archive.hasArchive()) return { skipped: 'no-archive-configured' };
-    const db = getDB(), now = Date.now(), results = {};
-    results.candles_base = await Archive.moveOldDocs(db, 'candles_base', 'time', new Date(now - 45 * 86400000));
-    const optSettings = await Options.getSettings();
-    results.option_snapshots = await Archive.moveOldDocs(db, 'option_snapshots', 'time', new Date(now - optSettings.snapshotTtlDays * 86400000));
-    results.telegram_outbox = await Archive.moveOldDocs(db, 'telegram_outbox', 'createdAt', new Date(now - 14 * 86400000));
-    results.logs = await Archive.moveOldDocs(db, 'logs', 'at', new Date(now - 14 * 86400000));
-    return results;
-}
-async function checkStorageAlert() {
-    try {
-        const sg = await Options.storageStats();
-        if (sg.storageMB <= 430) return;
-        if (!Archive.hasArchive()) { await notify(`🔴 دیتابیس اصلی ${sg.storageMB}/${sg.limitMB} MB — نزدیک پر شدن!\nیک اکانت رایگان MongoDB Atlas جدید بساز و آدرس اتصالش را در Render با نام MONGO_URI_ARCHIVE_1 اضافه کن.`); return; }
-        const target = await Archive.pickArchiveDB();
-        if (!target) await notify(`🔴 دیتابیس اصلی ${sg.storageMB} MB و همه‌ی دیتابیس‌های آرشیو هم پر شده‌اند!\nیک اکانت Atlas جدید بساز و متغیر MONGO_URI_ARCHIVE_${(process.env.MONGO_URI_ARCHIVE_5?6:process.env.MONGO_URI_ARCHIVE_4?5:process.env.MONGO_URI_ARCHIVE_3?4:process.env.MONGO_URI_ARCHIVE_2?3:2)} را در Render اضافه کن.`);
-    } catch (e) { console.error('❌ بررسی فضای دیتابیس:', e.message); }
-}
-app.post('/api/archive/run', async (req, res, next) => { try { res.json({ success: true, result: await runArchiving() }); } catch (e) { next(e); } });
-app.get('/api/archive/status', async (req, res, next) => { try { res.json({ configured: Archive.hasArchive(), safetyMB: Archive.SAFETY_MB, archives: await Archive.allArchiveStats() }); } catch (e) { next(e); } });
 
 // ---------------- تعطیلی (۱.۷) ----------------
 async function markHoliday(t) {
@@ -641,7 +617,14 @@ app.post('/api/evaluate-now', async (req, res, next) => {
 
 // ---------------- وضعیت ----------------
 app.get('/', async (req, res) => {
-    let pendingOutbox = 0; try { pendingOutbox = await getDB().collection('telegram_outbox').countDocuments({ sentAt: null }); } catch (e) {}
+    let pendingOutbox = 0;
+    try {
+        pendingOutbox = await getDB().collection('telegram_outbox').countDocuments({
+            sentAt: null,
+            attempts: { $lt: 120 },
+            createdAt: { $lt: new Date(Date.now() - 120000) }
+        });
+    } catch (e) {}
     const t = getTehranParts();
     res.json({ status: 'ok', version: SERVER_VERSION, startedAt: STARTED_AT, commit: process.env.RENDER_GIT_COMMIT || null, apiKeysConfigured: API_KEYS.length, adminRequired: !!ADMIN_TOKEN, telegramConfigured: !!(TELEGRAM_TOKEN && TELEGRAM_CHAT_ID),
         symbolsCached: symbolsCache.length, marketOpenNow: isMarketOpen(t), holidayToday: holidayDate === todayDateString(t),
@@ -684,7 +667,6 @@ Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayD
     await Options.ensureIndexes();
     await backfillDailyFromBase();
     await persistTfCandles().catch(e => console.error('❌ persistTfCandles:', e.message));
-    runArchiving().then(r => console.log('🗄 آرشیو اولیه:', JSON.stringify(r))).catch(e => console.error('❌ آرشیو اولیه ناموفق:', e.message));
     const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
     if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
     if (!ADMIN_TOKEN) console.warn('⚠️ ADMIN_TOKEN تنظیم نشده؛ مسیرهای تغییردهنده باز هستند.');
@@ -720,10 +702,6 @@ Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayD
     }, { timezone: 'Asia/Tehran' });
     cron.schedule('35 12 * * 6,0,1,2,3', () => { if (holidayDate !== todayDateString(getTehranParts())) sendDailySummary().catch(() => {}); }, { timezone: 'Asia/Tehran' });
     cron.schedule('0 10 * * 4', () => { sendWeeklyBackup().catch(e => console.error('❌ بکاپ هفتگی:', e.message)); }, { timezone: 'Asia/Tehran' });
-    cron.schedule('0 3 * * *', async () => {
-        try { const r = await runArchiving(); console.log('🗄 آرشیو انجام شد:', JSON.stringify(r)); await checkStorageAlert(); }
-        catch (e) { console.error('❌ آرشیو ناموفق:', e.message); }
-    }, { timezone: 'Asia/Tehran' });
     app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
     notify(`🚀 سرور ری‌استارت شد (${SERVER_VERSION})`).catch(() => {});
 }

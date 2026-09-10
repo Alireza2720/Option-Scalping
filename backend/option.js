@@ -328,8 +328,12 @@ function registerRoutes(app, ObjectId) {
         try {
             const s = await getSettings(), chain = await fetchChain(60000);
             const names = deps.getUnderlyingNames ? deps.getUnderlyingNames(req.params.underlying) : [norm(req.params.underlying)];
+            const matched = chain.filter(c => c.isCall && names.includes(c.underlying));
+            if (req.query.raw === '1') {
+                return res.json({ underlying: req.params.underlying, matchedNames: names, totalMatched: matched.length, raw: matched });
+            }
             const hv = await hvFromDaily(req.params.underlying);
-            const rows = chain.filter(c => c.isCall && names.includes(c.underlying)).map(c => { const m = metrics(c, c.S, hv); return { ...c, ...m, reject: rejectReasons(c, m, s) }; })
+            const rows = matched.map(c => { const m = metrics(c, c.S, hv); return { ...c, ...m, reject: rejectReasons(c, m, s) }; })
                 .sort((a, b) => a.expiry.localeCompare(b.expiry) || a.strike - b.strike);
             res.json({ underlying: req.params.underlying, matchedNames: names, S: rows[0] ? rows[0].S : null, hv, chainAgeSec: chainAge(), rows });
         } catch (e) { next(e); }
