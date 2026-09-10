@@ -1,709 +1,823 @@
-'use strict';
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const path = require('path');
-const cron = require('node-cron');
-const { ObjectId } = require('mongodb');
-const { connectDB, getDB } = require('./db');
-const Strat = require('./strategies.js');
-const { STRATEGIES, aggregateCandles, getRequiredCandles } = Strat;
-const Options = require('./option.js');
-const Log = require('./log.js');
-const Archive = require('./archive.js');
-const Settings = require('./settings.js');
-Log.patchConsole();
-const STARTED_AT = new Date();
-
-const app = express();
-app.disable('x-powered-by');
-const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = 'v5.0-closed-htf-secure';
-let holidayDate = null, inactiveTicks = 0;
-// ---------------- تنظیمات ----------------
-const API_KEYS = [process.env.BRSAPI_KEY_1 || process.env.BRSAPI_KEY, process.env.BRSAPI_KEY_2, process.env.BRSAPI_KEY_3].filter(Boolean);
-const PER_KEY_LIMIT = 90;
-const HISTORY_PER_KEY_LIMIT = 10; // سهمیه‌ی جداگانه‌ی وب‌سرویس History (دیتای روزانه)
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-const TF = Object.fromEntries(Object.entries(Strat.TIMEFRAME_MINUTES).filter(([k]) => k !== '4h'));
-const SESSION_START = 9 * 60, SESSION_END = 12 * 60 + 30;
-const toMin = s => { const [h, m] = String(s).split(':').map(Number); return h * 60 + (m || 0); };
-const fmtMin = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
-let ENTRY_START = toMin(process.env.ENTRY_START || '09:30');
-let ENTRY_END = toMin(process.env.ENTRY_END || '12:00');
-async function reloadEntryWindow() {
-    const w = Settings.entryWindow();
-    ENTRY_START = w.start;
-    ENTRY_END = w.end;
-}
-
-app.use(cors());
-app.use(express.json({ limit: '5mb' }));
-
-// ---------------- احراز هویت ادمین (۱.۶) ----------------
-app.use((req, res, next) => {
-    if (!['POST', 'PUT', 'DELETE'].includes(req.method)) return next();
-    if (!ADMIN_TOKEN) return next();
-    if (req.headers['x-admin-token'] === ADMIN_TOKEN) return next();
-    res.status(401).json({ error: 'توکن ادمین نامعتبر است' });
-});
-app.get('/api/auth/check', (req, res) => res.json({ required: !!ADMIN_TOKEN, ok: !ADMIN_TOKEN || req.headers['x-admin-token'] === ADMIN_TOKEN }));
-
-// ---------------- تنظیمات معاملات (قابل ویرایش از فرانت) ----------------
-app.get('/api/trading-settings', async (req, res, next) => {
-    try { res.json({ values: Settings.get(), defaults: Settings.DEFAULTS }); } catch (e) { next(e); }
-});
-app.put('/api/trading-settings', async (req, res, next) => {
-    try {
-        await Settings.save(req.body || {});
-        await reloadEntryWindow();
-        Options.reloadFromSettings();
-        res.json({ success: true, values: Settings.get() });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
-app.get('/strategies.js', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.sendFile(path.join(__dirname, 'strategies.js')); });
-
-// ---------------- زمان تهران ----------------
-function getTehranParts(date = new Date()) {
-    const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, weekday: 'short' });
-    const map = {}; fmt.formatToParts(date).forEach(p => { map[p.type] = p.value; });
-    return { year: +map.year, month: +map.month, day: +map.day, hour: (+map.hour) % 24, minute: +map.minute, second: +map.second, weekday: map.weekday };
-}
-const tehranPartsToUTCDate = (y, mo, d, h, mi) => new Date(Date.UTC(y, mo - 1, d, h, mi, 0) - 3.5 * 3600 * 1000);
-const minuteOfDay = t => t.hour * 60 + t.minute;
-const todayDateString = t => `${t.year}-${String(t.month).padStart(2, '0')}-${String(t.day).padStart(2, '0')}`;
-const isTradingDay = t => ['Sat', 'Sun', 'Mon', 'Tue', 'Wed'].includes(t.weekday);
-const isMarketOpen = t => isTradingDay(t) && minuteOfDay(t) >= SESSION_START && minuteOfDay(t) <= SESSION_END;
-function getBucketTime(t, size) { const b = Math.floor(minuteOfDay(t) / size) * size; return tehranPartsToUTCDate(t.year, t.month, t.day, Math.floor(b / 60), b % 60); }
-const dayStartUTC = t => tehranPartsToUTCDate(t.year, t.month, t.day, 0, 0);
-
-// ---------------- سهمیه‌ی کلیدها (چند نوع سهمیه: AllSymbols و History) ----------------
-const usageId = (i, prefix = 'allsymbols') => `${prefix}_usage_key${i + 1}`;
-async function getKeyUsage(i, prefix = 'allsymbols') {
-    const db = getDB(), today = todayDateString(getTehranParts());
-    let doc = await db.collection('meta').findOne({ _id: usageId(i, prefix) });
-    if (!doc || doc.date !== today) { await db.collection('meta').updateOne({ _id: usageId(i, prefix) }, { $set: { date: today, count: 0 } }, { upsert: true }); doc = { date: today, count: 0 }; }
-    return doc;
-}
-async function acquireApiKey(prefix = 'allsymbols', limit = PER_KEY_LIMIT) {
-    for (let i = 0; i < API_KEYS.length; i++) {
-        const u = await getKeyUsage(i, prefix);
-        if (u.count < limit) { await getDB().collection('meta').updateOne({ _id: usageId(i, prefix) }, { $inc: { count: 1 } }); return { key: API_KEYS[i], index: i }; }
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>شکارچی آپشن</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+    :root {
+        --bg:#0e1013; --bg-card:#14161a; --bg-input:#0e1013; --border:#21242a; --border-light:#2a2e35;
+        --text:#dfe2e6; --text-dim:#7d8590; --text-bright:#f0f2f5; --accent:#3d7dd8; --accent-hover:#326ec2;
+        --good:#2ea88a; --bad:#d9534f; --warn:#c9973d;
     }
-    return null;
-}
-async function getAllUsage() {
-    const keys = [];
-    for (let i = 0; i < API_KEYS.length; i++) { const u = await getKeyUsage(i); keys.push({ index: i + 1, count: u.count, limit: PER_KEY_LIMIT }); }
-    const hist = [];
-    for (let i = 0; i < API_KEYS.length; i++) { const u = await getKeyUsage(i, 'history'); hist.push({ index: i + 1, count: u.count, limit: HISTORY_PER_KEY_LIMIT }); }
-    return {
-        date: todayDateString(getTehranParts()), keys, total: keys.reduce((s, k) => s + k.count, 0), totalLimit: API_KEYS.length * PER_KEY_LIMIT,
-        history: { keys: hist, total: hist.reduce((s, k) => s + k.count, 0), totalLimit: API_KEYS.length * HISTORY_PER_KEY_LIMIT }
-    };
-}
-app.get('/api/usage', async (req, res, next) => { try { res.json(await getAllUsage()); } catch (e) { next(e); } });
+    [data-theme="light"] { --bg:#f5f6f8; --bg-card:#ffffff; --bg-input:#f0f1f4; --border:#e2e4e8; --border-light:#d1d4da; --text:#2c2f35; --text-dim:#7a7f8a; --text-bright:#1a1d22; --accent:#3d7dd8; --accent-hover:#2f6bc4; --good:#1e8a6e; --bad:#c9433e; --warn:#b8862a; }
+    [data-theme="stone"] { --bg:#2b2b2b; --bg-card:#333333; --bg-input:#262626; --border:#404040; --border-light:#4a4a4a; --text:#e0e0e0; --text-dim:#9a9a9a; --text-bright:#f5f5f5; --accent:#c9973d; --accent-hover:#b8862a; --good:#4caf50; --bad:#e57373; --warn:#ffb74d; }
+    [data-theme="deep"] { --bg:#0a0f1a; --bg-card:#111827; --bg-input:#0d1420; --border:#1e293b; --border-light:#2d3a4f; --text:#c9d6e8; --text-dim:#6b7a90; --text-bright:#e8eef7; --accent:#2ea88a; --accent-hover:#268f76; --good:#2ea88a; --bad:#ef5350; --warn:#ffa726; }
 
-// ---------------- لیست نمادها ----------------
-let symbolsCache = [];
-async function fetchAllSymbolsRaw() {
-    if (!API_KEYS.length) throw new Error('هیچ کلید BrsApi تنظیم نشده است.');
-    const picked = await acquireApiKey();
-    if (!picked) throw new Error('سهمیه‌ی روزانه‌ی همه‌ی کلیدها تمام شده است.');
-    const r = await fetch(`https://Api.BrsApi.ir/Tsetmc/AllSymbols.php?key=${picked.key}&type=1`, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, timeout: 20000 });
-    if (!r.ok) throw new Error(`HTTP ${r.status} (کلید ${picked.index + 1})`);
-    const data = await r.json();
-    if (!Array.isArray(data)) throw new Error('پاسخ نامعتبر از BrsApi');
-    return data;
+    * { box-sizing:border-box; margin:0; padding:0; }
+    html, body { overflow-x:hidden; max-width:100%; }
+    body { font-family:'Vazirmatn',Tahoma,sans-serif; background:var(--bg); color:var(--text); padding:24px; line-height:1.7; transition:background .3s, color .3s; }
+    .container { max-width:1280px; margin:0 auto; }
+
+    header { text-align:center; margin-bottom:22px; }
+    .brand { font-size:30px; font-weight:700; background:linear-gradient(135deg, var(--accent), var(--good)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; letter-spacing:-0.5px; margin-bottom:2px; }
+    .brand-sub { font-size:14px; color:var(--text-dim); letter-spacing:2px; text-transform:uppercase; font-weight:500; }
+
+    .hamburger-btn { position:fixed; top:18px; right:18px; z-index:1001; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; width:44px; height:44px; cursor:pointer; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; transition:border-color .2s; }
+    .hamburger-btn:hover { border-color:var(--accent); }
+    .hamburger-btn span { display:block; width:20px; height:2px; background:var(--text); border-radius:2px; }
+
+    .menu-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:999; opacity:0; visibility:hidden; transition:all .3s; }
+    .menu-overlay.open { opacity:1; visibility:visible; }
+
+    .menu-panel { position:fixed; top:0; right:-320px; width:300px; height:100vh; background:var(--bg-card); border-left:1px solid var(--border); z-index:1000; transition:right .3s ease; display:flex; flex-direction:column; overflow-y:auto; padding:20px; }
+    .menu-panel.open { right:0; }
+    .menu-panel h3 { font-size:16px; color:var(--text-bright); margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+    .menu-item { display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:8px; cursor:pointer; font-size:14px; color:var(--text); transition:background .15s; border:none; background:transparent; width:100%; text-align:right; font-family:inherit; }
+    .menu-item:hover { background:var(--border); }
+    .menu-divider { height:1px; background:var(--border); margin:12px 0; }
+    .menu-label { font-size:11px; color:var(--text-dim); padding:4px 14px; text-transform:uppercase; letter-spacing:1px; }
+    .menu-status-grid { display:grid; grid-template-columns:1fr; gap:6px; padding:0 14px; }
+    .menu-status-row { display:flex; justify-content:space-between; font-size:12.5px; padding:5px 8px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px; }
+    .theme-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; padding:6px 14px; }
+
+    .card { background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:16px; transition:background .3s, border-color .3s; }
+    .card h2 { font-size:14px; font-weight:600; color:var(--text-dim); margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+    .card.collapsible { padding:0; }
+    .card.collapsible > h2 { margin:0; padding:13px 20px; border-bottom:none; cursor:pointer; user-select:none; flex-wrap:nowrap; }
+    .card.collapsible > h2:hover { background:var(--border); }
+    .card.collapsible > h2 .chev { transition:transform .2s; color:var(--text-dim); font-size:12px; margin-right:auto; }
+    .card.collapsible.open > h2 .chev { transform:rotate(180deg); }
+    .card.collapsible > .card-body { display:none; padding:4px 20px 18px; border-top:1px solid var(--border); }
+    .card.collapsible.open > .card-body { display:block; }
+    .h2-title { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .count-pill { background:var(--border); color:var(--text-dim); padding:1px 9px; border-radius:20px; font-size:11.5px; font-weight:500; }
+
+    .form-row { display:flex; flex-wrap:wrap; gap:14px; align-items:end; margin-bottom:10px; }
+    .field { display:flex; flex-direction:column; gap:6px; min-width:150px; position:relative; }
+    .field label { font-size:12.5px; color:var(--text-dim); }
+    .field input, .field select { background:var(--bg-input); border:1px solid var(--border-light); color:var(--text); padding:10px 14px; border-radius:8px; font-family:inherit; font-size:13.5px; width:100%; transition:border-color .2s, box-shadow .2s; -webkit-appearance:none; appearance:none; }
+    .field select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%237d8590' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:left 12px center; padding-left:32px; }
+    .field input:focus, .field select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(61,125,216,.15); }
+    .hint { font-size:11.5px; color:var(--text-dim); margin-top:-4px; margin-bottom:8px; }
+
+    .autocomplete-list { position:absolute; top:100%; right:0; left:0; z-index:30; background:var(--bg-card); border:1px solid var(--border-light); border-radius:8px; margin-top:4px; max-height:200px; overflow-y:auto; display:none; box-shadow:0 8px 24px rgba(0,0,0,.3); }
+    .autocomplete-list div { padding:9px 14px; cursor:pointer; font-size:13px; transition:background .1s; }
+    .autocomplete-list div:hover { background:var(--border); }
+    .autocomplete-list small { color:var(--text-dim); margin-right:6px; }
+
+    .btn { background:var(--accent); color:#fff; border:none; padding:10px 20px; border-radius:8px; cursor:pointer; font-weight:500; font-family:inherit; font-size:13.5px; transition:all .15s; }
+    .btn:hover { background:var(--accent-hover); }
+    .btn:disabled { opacity:.4; cursor:not-allowed; }
+    .btn.outline { background:transparent; border:1px solid var(--border-light); color:var(--text); }
+    .btn.outline:hover { background:var(--border); }
+    .btn.danger { background:var(--bad); } .btn.danger:hover { background:#763333; }
+    .btn.small { padding:6px 12px; font-size:12px; }
+    .btn.tiny { padding:2px 8px; font-size:11px; border-radius:6px; }
+
+    .symbol-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:6px; }
+    .chip { display:flex; align-items:center; gap:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; padding:6px 8px 6px 6px; font-size:13px; min-width:0; transition:border-color .15s; }
+    .chip:hover { border-color:var(--border-light); }
+    .chip-sym { font-weight:600; color:var(--text-bright); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
+    .chip-cnt { font-size:10.5px; color:var(--text-dim); background:var(--border); padding:1px 7px; border-radius:12px; white-space:nowrap; }
+    .chip-ic { background:transparent; border:1px solid var(--border-light); color:var(--text-dim); cursor:pointer; font-size:11px; line-height:1; padding:2px 6px; border-radius:5px; font-family:inherit; transition:all .15s; }
+    .chip-ic:hover { color:var(--text-bright); background:var(--border-light); }
+    .chip-ic.x:hover { background:var(--bad); color:#fff; border-color:var(--bad); }
+    .empty-note { color:var(--text-dim); font-size:13px; padding:12px 0; }
+
+    .table-responsive { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    table.data-table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:600px; }
+    table.data-table th, table.data-table td { padding:5px 8px; text-align:center; border-bottom:1px solid var(--border); white-space:nowrap; vertical-align:middle; }
+    table.data-table th { color:var(--text-dim); font-weight:500; font-size:11.5px; }
+    table.data-table tr.symbol-start td { border-top:1px solid var(--border-light); }
+    .badge { padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; display:inline-block; }
+    .badge.long { background:rgba(46,168,138,.15); color:var(--good); }
+    .badge.short { background:rgba(217,83,79,.15); color:var(--bad); }
+    .badge.none { background:rgba(125,133,144,.15); color:var(--text-dim); }
+    .badge.warn { background:rgba(201,151,61,.15); color:var(--warn); }
+    .action-btns { display:flex; gap:4px; justify-content:center; flex-wrap:nowrap; }
+    .empty-row td { color:var(--text-dim); padding:20px; white-space:normal; }
+    .pos { color:var(--good); } .neg { color:var(--bad); }
+
+    .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-bottom:14px; }
+    .stat { background:var(--bg-input); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    .stat small { display:block; color:var(--text-dim); font-size:11px; }
+    .stat b { font-size:15px; font-weight:600; color:var(--text-bright); }
+
+    .chart-placeholder { display:flex; align-items:center; justify-content:center; min-height:280px; background:var(--bg-input); border-radius:8px; color:var(--text-dim); font-size:13px; text-align:center; padding:20px; }
+    #priceChart, #panelChart { border-radius:8px; overflow:hidden; }
+    .msg-warn { display:none; color:var(--warn); font-size:12px; margin-bottom:10px; background:rgba(201,151,61,.1); padding:8px 12px; border-radius:6px; }
+    .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11.5px; color:var(--text-dim); margin-bottom:8px; align-items:center; }
+    .legend i { display:inline-block; width:10px; height:3px; border-radius:2px; margin-left:5px; vertical-align:middle; }
+    .chart-title { font-size:12.5px; color:var(--text-dim); margin-bottom:6px; }
+
+    #alertContainer { position:fixed; top:20px; left:20px; z-index:999; display:flex; flex-direction:column; gap:8px; max-width:360px; }
+    .alert-box { padding:12px 16px; border-radius:8px; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.4); animation:slideIn .2s ease; cursor:pointer; }
+    .alert-box.error { background:#4a2323; border:1px solid #8a3d3d; color:#f0c9c9; }
+    .alert-box.warn { background:#4a3d23; border:1px solid #8a733d; color:#f0e3c9; }
+    .alert-box.success { background:#1f3d33; border:1px solid #2ea88a; color:#c9f0e3; }
+    .alert-box.info { background:#1f2b3d; border:1px solid #3d7dd8; color:#c9dcf0; }
+    @keyframes slideIn { from { opacity:0; transform:translateX(-20px);} to { opacity:1; transform:translateX(0);} }
+    @keyframes spin { to { transform:rotate(360deg); } }
+
+    .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:900; display:none; align-items:center; justify-content:center; padding:16px; }
+    .modal-bg.open { display:flex; }
+    .modal { background:var(--bg-card); border:1px solid var(--border-light); border-radius:12px; max-width:1000px; width:100%; max-height:90vh; overflow:auto; padding:20px; }
+    .modal h3 { font-size:15px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; }
+    .tabs { display:flex; gap:6px; border-bottom:1px solid var(--border); margin-bottom:14px; }
+    .tab { padding:8px 14px; cursor:pointer; font-size:13px; color:var(--text-dim); border-bottom:2px solid transparent; transition:all .15s; background:transparent; border:none; font-family:inherit; }
+    .tab:hover { color:var(--text); }
+    .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+
+    ::-webkit-scrollbar { width:7px; height:7px; } ::-webkit-scrollbar-thumb { background:var(--border-light); border-radius:4px; }
+
+    @media (max-width:900px) { .symbol-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    @media (max-width:640px) {
+        body { padding:12px; } .brand { font-size:22px; } .brand-sub { font-size:11px; }
+        .field { min-width:100%; } .form-row { gap:10px; } .card { padding:14px; }
+        .card.collapsible { padding:0; } .card.collapsible > h2 { padding:12px 14px; } .card.collapsible > .card-body { padding:4px 14px 14px; }
+        .symbol-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        #priceChart { height:260px !important; } #panelChart { height:120px !important; }
+        #alertContainer { left:10px; right:10px; max-width:none; top:10px; }
+        table.data-table th, table.data-table td { padding:5px 5px; font-size:11px; }
+        .menu-panel { width:280px; }
+    }
+</style>
+</head>
+<body>
+
+<div id="bootOverlay" style="position:fixed; inset:0; background:var(--bg); z-index:1000; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:20px; text-align:center;">
+    <div style="width:36px; height:36px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;"></div>
+    <p id="bootMessage" style="color:var(--text-dim); font-size:13.5px;">در حال اتصال به سرور...</p>
+    <button class="btn small" id="bootRetryBtn" style="display:none;" onclick="location.reload()">تلاش مجدد</button>
+</div>
+<div id="alertContainer"></div>
+
+<button class="hamburger-btn" id="hamburgerBtn" onclick="toggleMenu()">
+    <span></span><span></span><span></span>
+</button>
+<div class="menu-overlay" id="menuOverlay" onclick="toggleMenu()"></div>
+<div class="menu-panel" id="menuPanel">
+    <h3>منوی اصلی</h3>
+
+    <div class="menu-label">وضعیت سرور</div>
+    <div class="menu-status-grid">
+        <div class="menu-status-row"><span>سرور</span><b id="backendStatus" style="font-weight:600;">در حال بررسی</b></div>
+        <div class="menu-status-row"><span>بازار</span><b id="marketStatus">-</b></div>
+        <div class="menu-status-row"><span>مصرف API</span><b id="usageAllSymbols">-</b></div>
+        <div class="menu-status-row"><span>سلامت</span><b id="healthStatus">-</b></div>
+    </div>
+
+    <div class="menu-divider"></div>
+    <div class="menu-label">تم</div>
+    <div class="theme-grid">
+        <button class="btn tiny outline" onclick="setTheme('dark')">تاریک</button>
+        <button class="btn tiny outline" onclick="setTheme('light')">روشن</button>
+        <button class="btn tiny outline" onclick="setTheme('stone')">سنگی</button>
+        <button class="btn tiny outline" onclick="setTheme('deep')">دیپ</button>
+    </div>
+
+    <div class="menu-divider"></div>
+    <div class="menu-label">تنظیمات</div>
+    <button class="menu-item" onclick="openSettings(); toggleMenu();">تنظیمات</button>
+
+    <div class="menu-divider"></div>
+    <div class="menu-label">عملیات</div>
+    <button class="menu-item" onclick="changeToken(); toggleMenu();">تغییر توکن</button>
+    <button class="menu-item" onclick="openLogs('memory'); toggleMenu();">لاگ سیستم</button>
+    <button class="menu-item" onclick="testTelegram(); toggleMenu();">تست تلگرام</button>
+    <button class="menu-item" onclick="runBackupNow(); toggleMenu();">بکاپ</button>
+</div>
+
+<div class="modal-bg" id="modalBg" onclick="if(event.target===this) closeModal()">
+    <div class="modal">
+        <h3><span id="modalTitle"></span><button class="btn small outline" onclick="closeModal()">بستن</button></h3>
+        <div id="modalBody"></div>
+    </div>
+</div>
+
+<div class="container">
+    <header>
+        <div class="brand">شکارچی آپشن</div>
+        <div class="brand-sub">Option Hunter</div>
+    </header>
+
+    <div class="card collapsible" id="cardSymbols">
+        <h2 onclick="toggleCard('cardSymbols')">
+            <span class="h2-title">۱. نمادهای زیر نظر <span class="count-pill" id="symbolCountLabel">0</span></span>
+            <span class="chev">▼</span>
+        </h2>
+        <div class="card-body">
+            <div class="form-row" style="margin-top:12px;">
+                <div class="field">
+                    <label>افزودن نماد</label>
+                    <input type="text" id="symbolSearchInput" placeholder="مثلاً فملی" autocomplete="off">
+                    <div class="autocomplete-list" id="autocompleteList"></div>
+                </div>
+                <button class="btn" onclick="addMonitoredSymbol()">افزودن</button>
+            </div>
+            <div class="symbol-grid" id="symbolGrid"><div class="empty-note">نمادی اضافه نشده است</div></div>
+        </div>
+    </div>
+
+    <div class="card collapsible" id="cardConfig">
+        <h2 onclick="toggleCard('cardConfig')">
+            <span class="h2-title">۲. ایجاد استراتژی</span>
+            <span class="chev">▼</span>
+        </h2>
+        <div class="card-body">
+            <div class="form-row" style="margin-top:12px;">
+                <div class="field"><label>نماد</label><select id="configSymbolSelect"><option value="">-- ابتدا نماد اضافه کنید --</option></select></div>
+                <div class="field"><label>استراتژی</label><select id="strategySelect"></select></div>
+                <div class="field"><label>تایم‌فریم ورود</label><select id="timeframeSelect"></select></div>
+                <div class="field"><label>تایم‌فریم بالا (روند)</label><select id="htfSelect"></select></div>
+                <div class="field"><label>نوع کندل</label><select id="candleTypeSelect"><option value="heikin">هیکن آشی</option><option value="simple">ساده</option></select></div>
+            </div>
+            <div id="paramsContainer" class="form-row"></div>
+            <div style="margin-top:6px;"><button class="btn" onclick="addStrategyConfig()">ایجاد استراتژی</button></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>لیست پایش فعال</h2>
+        <div class="table-responsive">
+        <table class="data-table">
+            <thead><tr><th style="width:100px;">نماد</th><th>استراتژی</th><th>تایم‌فریم</th><th>کندل</th><th>روند بالا</th><th>وضعیت</th><th>فعال</th><th>عملیات</th></tr></thead>
+            <tbody id="configsBody"><tr class="empty-row"><td colspan="8">تنظیمی ایجاد نشده است</td></tr></tbody>
+        </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>نمودار <span id="chartSymbolLabel" style="color:var(--text-dim); font-weight:400;"></span><button class="btn small outline" onclick="resetZoom()">فیت</button></h2>
+        <div class="msg-warn" id="insufficientDataMsg"></div>
+        <div class="legend" id="chartLegend"></div>
+        <div id="priceChartWrapper"><div class="chart-placeholder">برای مشاهده، در جدول بالا روی «نمودار» کلیک کنید.</div></div>
+        <div id="panelChartWrapper" style="display:none; margin-top:18px;">
+            <div class="chart-title" id="panelTitle"></div>
+            <div id="panelChart" style="height:180px;"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>موقعیت‌های اخیر آپشن</h2>
+        <div class="stats-grid" id="optStats"></div>
+        <div class="table-responsive"><table class="data-table">
+            <thead><tr><th>پایه</th><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>ورود</th><th>قیمت ورود</th><th>قیمت فعلی/خروج</th><th>بازده</th><th>پایه ورود→فعلی</th><th>IV</th><th>دلیل خروج</th><th></th></tr></thead>
+            <tbody id="optBody"><tr class="empty-row"><td colspan="12">موقعیتی ثبت نشده است</td></tr></tbody>
+        </table></div>
+    </div>
+
+    <div class="card">
+        <h2>تاریخچه سیگنال‌های ارسال‌شده <button class="btn small danger" onclick="clearSignalHistory()">پاک کردن</button></h2>
+        <div class="table-responsive">
+        <table class="data-table">
+            <thead><tr><th>زمان کندل</th><th>نماد</th><th>استراتژی</th><th>سیگنال</th><th>قیمت</th><th>روند بالا</th><th>دلیل</th><th>وضعیت</th></tr></thead>
+            <tbody id="signalHistoryBody"><tr class="empty-row"><td colspan="8">سیگنالی ثبت نشده است</td></tr></tbody>
+        </table>
+        </div>
+    </div>
+</div>
+
+<script>
+const BACKEND_URL = 'https://api.optionhunter.ir';
+const TF_LABELS = { '1m':'۱ دقیقه','3m':'۳ دقیقه','5m':'۵ دقیقه','10m':'۱۰ دقیقه','15m':'۱۵ دقیقه','30m':'۳۰ دقیقه','1h':'۱ ساعت','1d':'روزانه' };
+const TF_MIN = { '1m':1,'3m':3,'5m':5,'10m':10,'15m':15,'30m':30,'1h':60,'1d':1440 };
+const SIGNAL_LABELS = { BUY:'خرید کال', EXIT_LONG:'خروج از کال' };
+const PARAM_LABELS = {
+    rsiFastPeriod:'دوره RSI سریع', rsiSlowPeriod:'دوره RSI کند', rsiOversold:'آستانه اشباع فروش RSI', rsiOverbought:'آستانه اشباع خرید RSI',
+    lookback:'تعداد کندل نگاه به عقب', maxHoldBars:'حداکثر کندل نگه‌داری', cooldownBars:'کندل استراحت پس از خروج',
+    emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', pullbackPct:'حداکثر فاصله از EMA سریع (٪)', exitBufferPct:'بافر خروج (٪)',
+    macdFast:'دوره MACD سریع', macdSlow:'دوره MACD کند', macdSignal:'دوره Signal',
+    tenkanPeriod:'دوره Tenkan-sen', kijunPeriod:'دوره Kijun-sen', senkouBPeriod:'دوره Senkou Span B',
+    htfEma:'EMA تایم‌فریم بالا', htfRsiPeriod:'RSI تایم‌فریم بالا', atrPeriod:'دوره ATR', atrMult:'ضریب ATR', requireNoLowerWick:'کندل HA بدون سایه پایین (1/0)'
+};
+const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر',
+    macd:'MACD', signal:'Signal', hist:'هیستوگرام', tenkan:'Tenkan', kijun:'Kijun', spanA:'Span A', spanB:'Span B' };
+const OPT_LABELS = { minDays:'حداقل روز تا سررسید', maxDays:'حداکثر روز تا سررسید', maxSpreadPct:'حداکثر اسپرد (٪)', minOI:'حداقل موقعیت باز', minTrades:'حداقل معامله امروز', minPremium:'حداقل پرمیوم (ریال)', deltaMin:'حداقل دلتا', deltaMax:'حداکثر دلتا', maxIvHv:'حداکثر IV/HV', rewardRisk:'هدف = چند برابر ریسک', topN:'تعداد پیشنهاد', optionStopPct:'حد ضرر آپشن (٪)', take1Pct:'هشدار نیمه‌فروش (٪)', take2Pct:'حد سود کامل (٪)', closeDaysBefore:'بستن X روز قبل سررسید', snapshotTtlDays:'نگه‌داری اسنپ‌شات (روز)' };
+const TRADING_LABELS = { ENTRY_START: 'شروع بازه‌ی مجاز ورود (HH:MM)', ENTRY_END: 'پایان بازه‌ی مجاز ورود (HH:MM)', OPTION_FEE_BUY: 'کارمزد خرید آپشن', OPTION_FEE_SELL: 'کارمزد فروش آپشن', RISK_FREE_RATE: 'نرخ بدون ریسک سالانه' };
+const COLORS = ['#3d7dd8','#c9973d','#b565d9','#2ea88a','#d9534f'];
+
+let strategiesInfo = [], monitoredSymbols = [], configs = [], statusMap = {};
+let selectedConfigId = null;
+let priceChart = null, panelChart = null, candleSeries = null, overlaySeries = {}, panelSeries = {}, chartConfigId = null;
+let currentTheme = localStorage.getItem('theme') || 'dark';
+
+function setTheme(t) {
+    currentTheme = t; localStorage.setItem('theme', t);
+    document.documentElement.setAttribute('data-theme', t);
+    if (priceChart) {
+        try {
+            const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-card').trim();
+            const txt = getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim();
+            priceChart.applyOptions({ layout: { background: { color: bg }, textColor: txt } });
+            panelChart && panelChart.applyOptions({ layout: { background: { color: bg }, textColor: txt } });
+        } catch (e) {}
+    }
 }
-async function updateSymbolsCacheFromRaw(raw) {
-    symbolsCache = raw.filter(s => s.l18).map(s => ({ symbol: s.l18, name: s.l30, price: s.pl }));
-    await getDB().collection('meta').updateOne({ _id: 'symbols_cache' }, { $set: { symbols: symbolsCache, updatedAt: new Date() } }, { upsert: true }).catch(() => {});
+setTheme(currentTheme);
+
+function toggleMenu() {
+    document.getElementById('menuPanel').classList.toggle('open');
+    document.getElementById('menuOverlay').classList.toggle('open');
 }
-async function loadSymbolsCacheFromDB() {
-    const doc = await getDB().collection('meta').findOne({ _id: 'symbols_cache' });
-    if (doc && doc.symbols && doc.symbols.length) { symbolsCache = doc.symbols; return true; }
+function toggleCard(id) { document.getElementById(id).classList.toggle('open'); }
+function openModal(title, html) { document.getElementById('modalTitle').textContent = title; document.getElementById('modalBody').innerHTML = html; document.getElementById('modalBg').classList.add('open'); }
+function closeModal() { document.getElementById('modalBg').classList.remove('open'); }
+
+const activeAlerts = new Set();
+function showAlert(msg, type='error', dur=7000) {
+    if (activeAlerts.has(msg)) return; activeAlerts.add(msg);
+    const box = document.createElement('div'); box.className = `alert-box ${type}`; box.textContent = msg;
+    const rm = () => { box.remove(); activeAlerts.delete(msg); }; box.onclick = rm;
+    document.getElementById('alertContainer').appendChild(box); setTimeout(rm, dur);
+    if (type === 'error' || type === 'warn') clog(type, msg);
+}
+const clientLogs = [];
+function clog(level, msg) { clientLogs.push({ level, msg: String(msg), at: new Date() }); if (clientLogs.length > 200) clientLogs.shift(); }
+window.addEventListener('error', e => clog('error', `${e.message} (${e.filename||''}:${e.lineno||''})`));
+window.addEventListener('unhandledrejection', e => clog('error', 'Promise: ' + ((e.reason && e.reason.message) || e.reason)));
+
+const fmtT = ts => new Intl.DateTimeFormat('fa-IR',{ timeZone:'Asia/Tehran', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).format(new Date(ts*1000));
+const pct = v => typeof v === 'number' ? `<span class="${v>=0?'pos':'neg'}">${v>=0?'+':''}${v.toFixed(2)}٪</span>` : '-';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtN = n => n === null || n === undefined ? '-' : Math.round(n).toLocaleString();
+const fmtIv = v => v ? (v*100).toFixed(0)+'٪' : '-';
+const trendBadge = t => {
+    if (!t) return '<span class="badge none">-</span>';
+    const up = /up|bull|صعود/i.test(t), dn = /down|bear|نزول/i.test(t);
+    return `<span class="badge ${up?'long':dn?'short':'none'}">${esc(t)}</span>`;
+};
+
+function getToken() { return localStorage.getItem('adminToken') || ''; }
+
+async function changeToken() {
+    const input = prompt('توکن ادمین (ADMIN_TOKEN روی سرور):', getToken());
+    if (input === null) return;
+    const t = input.trim();
+    if (!t) return showAlert('توکن خالی است.', 'warn', 3000);
+    try {
+        const res = await fetch(`${BACKEND_URL}/api/auth/check`, { headers: { 'x-admin-token': t } });
+        const d = await res.json();
+        if (d.ok) { localStorage.setItem('adminToken', t); showAlert('توکن درست است و ذخیره شد.', 'success', 4000); await checkBackendStatus(); }
+        else showAlert('توکن نادرست است. دوباره امتحان کنید.', 'error', 5000);
+    } catch (e) { showAlert('خطا در بررسی توکن: ' + e.message, 'error', 5000); }
+}
+async function testTelegram() { try { await apiFetch(`${BACKEND_URL}/api/telegram/test`, { method:'POST' }); showAlert('پیام تست ارسال شد؛ تلگرام را چک کنید.', 'success', 5000); } catch (e) { showAlert('خطا در ارسال تست: ' + e.message); } }
+async function runBackupNow() { try { await apiFetch(`${BACKEND_URL}/api/backup/run`, { method:'POST' }); showAlert('بکاپ ارسال شد؛ تلگرام را چک کنید.', 'success', 5000); } catch (e) { showAlert('خطا در ارسال بکاپ: ' + e.message); } }
+
+async function apiFetch(url, options={}, retries=1) {
+    options.headers = { ...(options.headers||{}), 'x-admin-token': getToken() };
+    let lastErr;
+    for (let a = 0; a <= retries; a++) {
+        try {
+            const res = await fetch(url, options);
+            const ct = res.headers.get('content-type') || '';
+            if (!ct.includes('application/json')) throw new Error('پاسخ نامعتبر از سرور');
+            const data = await res.json();
+            if (res.status === 401) {
+                const t = prompt('این عمل نیاز به توکن ادمین دارد. توکن را وارد کنید:');
+                if (t) { localStorage.setItem('adminToken', t.trim()); options.headers['x-admin-token'] = t.trim(); lastErr = new Error('توکن نامعتبر'); continue; }
+                throw new Error('توکن ادمین وارد نشد');
+            }
+            if (!res.ok) throw new Error(data.error || 'خطای نامشخص');
+            return data;
+        } catch (e) { lastErr = e; if (a < retries) await new Promise(r => setTimeout(r, 1500)); }
+    }
+    throw lastErr;
+}
+
+async function waitForBackend(max=12, delay=3000) {
+    for (let i = 0; i < max; i++) {
+        try { await apiFetch(`${BACKEND_URL}/ping`); return true; }
+        catch { document.getElementById('bootMessage').textContent = `در حال اتصال به سرور... تلاش ${i+1} از ${max}`; await new Promise(r => setTimeout(r, delay)); }
+    }
     return false;
 }
-app.get('/api/symbols/search', (req, res) => {
-    const q = (req.query.q || '').trim(); if (!q) return res.json([]);
-    res.json(symbolsCache.filter(s => s.symbol.includes(q) || (s.name && s.name.includes(q))).slice(0, 20));
-});
-// تیکر (فملی) در چین آپشن به‌صورت نام کامل شرکت ظاهر می‌شود؛ هر دو حالت را برای تطبیق برمی‌گردانیم
-function getUnderlyingNames(symbol) {
-    const names = new Set([Options.norm(symbol)]);
-    const found = symbolsCache.find(s => s.symbol === symbol);
-    if (found && found.name) names.add(Options.norm(found.name));
-    return Array.from(names);
+function loadScriptOnce(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('بارگذاری ناموفق')); document.body.appendChild(s); }); }
+async function loadStrategiesLibrary(max=5) {
+    for (let i = 0; i < max; i++) {
+        try { await loadScriptOnce(`${BACKEND_URL}/strategies.js?v=${Date.now()}`); if (window.TradingStrategies) return true; throw new Error(); }
+        catch { document.getElementById('bootMessage').textContent = `خطا در بارگذاری استراتژی‌ها، تلاش ${i+1} از ${max}...`; await new Promise(r => setTimeout(r, 2000)); }
+    }
+    return false;
 }
 
-// ---------------- تلگرام با صف ارسال (۱.۳) ----------------
-async function telegramSend(text) {
-    if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) throw new Error('تلگرام تنظیم نشده است');
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }), timeout: 15000 });
-    const d = await r.json(); if (!d.ok) throw new Error(d.description || 'خطای تلگرام');
-}
-let flushing = false;
-async function flushOutbox() {
-    if (flushing) return; flushing = true;
+let warnedTelegram = false, warnedToken = false;
+async function checkBackendStatus() {
     try {
-        const col = getDB().collection('telegram_outbox');
-        const pending = await col.find({ sentAt: null, attempts: { $lt: 120 } }).sort({ createdAt: 1 }).limit(10).toArray();
-        for (const p of pending) {
-            try { await telegramSend(p.text); await col.updateOne({ _id: p._id }, { $set: { sentAt: new Date() } }); }
-            catch (e) { await col.updateOne({ _id: p._id }, { $inc: { attempts: 1 }, $set: { lastError: e.message } }); console.error('❌ تلگرام:', e.message); break; }
-        }
-    } finally { flushing = false; }
-}
-async function notify(text) {
-    await getDB().collection('telegram_outbox').insertOne({ text, createdAt: new Date(), attempts: 0, sentAt: null });
-    flushOutbox().catch(() => {});
-}
-app.post('/api/telegram/test', async (req, res, next) => {
-    try { await notify('🔔 پیام تست — اگر این را در تلگرام می‌بینید، ارسال سالم است.'); await flushOutbox(); res.json({ success: true }); } catch (e) { next(e); }
-});
-// ---------------- سلامت سیستم (۱.۴) ----------------
-const health = { consecutiveFailures: 0, alerted: false, lastError: null, lastTickAt: null };
-async function bumpDayStat(field, n = 1) {
-    const today = todayDateString(getTehranParts());
-    await getDB().collection('meta').updateOne({ _id: `daystats_${today}` }, { $inc: { [field]: n }, $set: { date: today } }, { upsert: true }).catch(() => {});
-}
-async function recordTickFailure(msg) {
-    health.consecutiveFailures++; health.lastError = msg; await bumpDayStat('ticksFail');
-    console.error('❌ تیک ناموفق:', msg);
-    if (health.consecutiveFailures === 5 && !health.alerted) { health.alerted = true; await notify(`🔴 پنج تیک پیاپی ناموفق — بازار پایش نمی‌شود!\nآخرین خطا: ${msg}`); }
-}
-async function recordTickSuccess() {
-    if (health.alerted) { health.alerted = false; await notify('🟢 سیستم به حالت عادی برگشت.'); }
-    health.consecutiveFailures = 0; health.lastTickAt = new Date(); await bumpDayStat('ticksOk');
-}
-async function sendDailySummary() {
-    const today = todayDateString(getTehranParts());
-    const st = await getDB().collection('meta').findOne({ _id: `daystats_${today}` }) || {};
-    const usage = await getAllUsage();
-    let optLine = '', storLine = '';
-    try { const list = await getDB().collection('option_positions').find({}).toArray(); const s = Options.positionStats(list); optLine = `\nآپشن: باز ${s.open} | بسته ${s.closed} | وین‌ریت ${s.winRate.toFixed(0)}٪ | بازده کل ${s.totalPnl.toFixed(0)}٪`; } catch (e) {}
-    try {
-        const sg = await Options.storageStats();
-        storLine = `\nدیتابیس اصلی: ${sg.storageMB} MB`;
-    } catch (e) {}
-    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
-}
-
-// ---------------- بکاپ هفتگی تنظیمات (Atlas رایگان بکاپ خودکار ندارد) ----------------
-async function telegramSendBackup(filename, jsonObj) {
-    if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) throw new Error('تلگرام تنظیم نشده است');
-    const blob = new Blob([JSON.stringify(jsonObj, null, 2)], { type: 'application/json' });
-    const form = new FormData();
-    form.append('chat_id', TELEGRAM_CHAT_ID);
-    form.append('caption', `💾 بکاپ تنظیمات (${todayDateString(getTehranParts())})`);
-    form.append('document', blob, filename);
-    const r = await globalThis.fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`, { method: 'POST', body: form });
-    const d = await r.json(); if (!d.ok) throw new Error(d.description || 'خطای ارسال بکاپ به تلگرام');
-}
-async function sendWeeklyBackup() {
-    const db = getDB();
-    const [symbols, configs, optSettings] = await Promise.all([
-        db.collection('monitored_symbols').find({}).toArray(),
-        db.collection('strategy_configs').find({}).toArray(),
-        db.collection('meta').findOne({ _id: 'option_settings' })
-    ]);
-    await telegramSendBackup(`backup_${todayDateString(getTehranParts())}.json`, { exportedAt: new Date(), monitoredSymbols: symbols, strategyConfigs: configs, optionSettings: optSettings || null });
-}
-app.post('/api/backup/run', async (req, res, next) => { try { await sendWeeklyBackup(); res.json({ success: true }); } catch (e) { next(e); } });
-
-// ---------------- تعطیلی (۱.۷) ----------------
-async function markHoliday(t) {
-    holidayDate = todayDateString(t);
-    await getDB().collection('meta').updateOne({ _id: 'holiday' }, { $set: { date: holidayDate } }, { upsert: true });
-    await notify(`📅 امروز (${holidayDate}) معامله‌ای در بازار دیده نشد؛ احتمالاً تعطیل است. پایش تا فردا متوقف شد.`);
-}
-
-// برداشتن دستی علامت تعطیلی (نیاز به توکن ادمین دارد چون DELETE است)
-app.delete('/api/holiday', async (req, res, next) => {
-    try { holidayDate = null; inactiveTicks = 0; await getDB().collection('meta').deleteOne({ _id: 'holiday' }); res.json({ success: true }); } catch (e) { next(e); }
-});
-
-// ---------------- کندل‌ها ----------------
-async function getBaseCandles(symbol) {
-    const base = await getDB().collection('candles_base').find({ symbol }).sort({ time: 1 }).toArray();
-    return base.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 }));
-}
-// ۱.۸-۲: کندل ۱۲:۰۰ تایم‌فریم ۱ ساعته (فقط ۳۰ دقیقه) در کندل ۱۱:۰۰ ادغام می‌شود
-function mergeSessionTail(candles, tfMin) {
-    if (tfMin !== 60) return candles;
-    const out = [];
-    for (const c of candles) {
-        const t = getTehranParts(new Date(c.time * 1000)), prev = out[out.length - 1];
-        if (t.hour === 12 && prev) {
-            const pt = getTehranParts(new Date(prev.time * 1000));
-            if (pt.day === t.day && pt.month === t.month && pt.hour === 11) {
-                prev.high = Math.max(prev.high, c.high); prev.low = Math.min(prev.low, c.low); prev.close = c.close;
-                prev.barCount = (prev.barCount || 0) + (c.barCount || 0); prev.expectedBars = (prev.expectedBars || 0) + (c.expectedBars || 0);
-                prev.complete = prev.barCount >= Math.max(1, prev.expectedBars) * 0.6;
-                continue;
-            }
-        }
-        out.push({ ...c });
-    }
-    return out;
-}
-function buildTfCandles(permanentRows, baseCandles, tfMin) {
-    const live = mergeSessionTail(aggregateCandles(baseCandles, tfMin), tfMin);
-    const map = new Map(permanentRows.map(c => [Math.floor(c.time.getTime() / 1000), { time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete }]));
-    for (const c of live) map.set(c.time, c); // داده‌ی زنده (دقیق‌تر برای روزهای اخیر) جایگزین می‌شود
-    return Array.from(map.values()).sort((a, b) => a.time - b.time);
-}
-// سریع — فقط دیتابیس اصلی؛ در مسیر تیک هر‌دقیقه‌ای استفاده می‌شود
-async function getCandles(symbol, tf) {
-    if (tf === '1d') {
-        const d = await getDB().collection('candles_daily').find({ symbol }).sort({ time: 1 }).toArray();
-        return d.map(c => ({ time: Math.floor(c.time.getTime() / 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 }));
-    }
-    const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
-    return buildTfCandles(permanent, await getBaseCandles(symbol), TF[tf]);
-}
-// کامل — دیتابیس اصلی + آرشیو؛ فقط برای نمودار و بک‌تست (کندتر، ولی همیشه تاریخچه‌ی کامل)
-async function getBaseCandlesWithArchive(symbol) {
-    const primary = await getBaseCandles(symbol);
-    if (!Archive.hasArchive()) return primary;
-    const archived = await Archive.getArchivedBaseCandles(symbol).catch(e => { console.error('❌ خواندن آرشیو کندل:', e.message); return []; });
-    if (!archived.length) return primary;
-    const map = new Map(archived.map(c => [c.time, c]));
-    primary.forEach(c => map.set(c.time, c)); // در صورت تداخل، نسخه‌ی دیتابیس اصلی اولویت دارد
-    return Array.from(map.values()).sort((a, b) => a.time - b.time);
-}
-async function getCandlesFull(symbol, tf) {
-    if (tf === '1d' || !Archive.hasArchive()) return getCandles(symbol, tf);
-    const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
-    return buildTfCandles(permanent, await getBaseCandlesWithArchive(symbol), TF[tf]);
-}
-async function activeConfigTimeframes() {
-    const configs = await getDB().collection('strategy_configs').find({}).toArray();
-    const set = new Set();
-    configs.forEach(c => { if (TF[c.timeframe] && c.timeframe !== '1d') set.add(c.timeframe); if (TF[c.htfTimeframe] && c.htfTimeframe !== '1d') set.add(c.htfTimeframe); });
-    return set;
-}
-// ذخیره‌ی دائمی کندل‌های روزهای گذشته قبل از اینکه از پنجره‌ی ۴۵ روزه‌ی candles_base خارج شوند
-async function persistTfCandles() {
-    const db = getDB(), tfs = await activeConfigTimeframes(); if (!tfs.size) return;
-    const todayStart = Math.floor(dayStartUTC(getTehranParts()).getTime() / 1000);
-    const monitored = await db.collection('monitored_symbols').find({}).toArray();
-    for (const m of monitored) {
-        const base = await getBaseCandles(m.symbol); if (!base.length) continue;
-        for (const tf of tfs) {
-            const candles = mergeSessionTail(aggregateCandles(base, TF[tf]), TF[tf]);
-            for (const c of candles) {
-                if (c.time >= todayStart) continue; // کندل امروز هنوز کامل نیست
-                await db.collection('candles_tf').updateOne({ symbol: m.symbol, tf, time: new Date(c.time * 1000) },
-                    { $set: { symbol: m.symbol, tf, time: new Date(c.time * 1000), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, complete: c.complete } }, { upsert: true });
-            }
-        }
-    }
-}
-// ۱.۱: فقط کندل‌های بسته‌شده
-function isCandleClosed(timeSec, tfMin, now = new Date()) {
-    const t = getTehranParts(new Date(timeSec * 1000));
-    const sessionEnd = tehranPartsToUTCDate(t.year, t.month, t.day, 12, 31);
-    if (tfMin >= 1440 || (tfMin === 60 && t.hour === 11)) return now >= sessionEnd;
-    const natural = new Date(timeSec * 1000 + tfMin * 60000);
-    return now >= (natural < sessionEnd ? natural : sessionEnd);
-}
-const closedOnly = (candles, tf) => { const now = new Date(); return candles.filter(c => isCandleClosed(c.time, TF[tf], now)); };
-
-async function upsertLiveCandle(symbol, time, price, volDelta) {
-    await getDB().collection('candles_base').updateOne({ symbol, time },
-        { $setOnInsert: { symbol, time, open: price }, $set: { close: price }, $max: { high: price }, $min: { low: price }, $inc: { volume: volDelta || 0 } }, { upsert: true });
-}
-async function upsertDailyCandle(symbol, time, s) {
-    const pl = +s.pl; const num = v => (+v > 0 ? +v : pl);
-    await getDB().collection('candles_daily').updateOne({ symbol, time },
-        { $set: { symbol, time, open: num(s.pf), high: num(s.pmax), low: num(s.pmin), close: pl, volume: +s.tvol || 0, trades: +s.tno || 0, source: 'live' } }, { upsert: true });
-}
-async function backfillDailyFromBase() {
-    const db = getDB();
-    const symbols = await db.collection('monitored_symbols').find({}).toArray();
-    for (const m of symbols) {
-        const daily = aggregateCandles(await getBaseCandles(m.symbol), 1440);
-        for (const c of daily) {
-            const time = new Date(c.time * 1000);
-            await db.collection('candles_daily').updateOne({ symbol: m.symbol, time }, { $setOnInsert: { symbol: m.symbol, time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0, source: 'backfill' } }, { upsert: true });
-        }
+        const d = await apiFetch(`${BACKEND_URL}/`);
+        const bs = document.getElementById('backendStatus');
+        bs.textContent = d.apiKeysConfigured ? 'متصل' : 'قطع';
+        bs.style.color = d.apiKeysConfigured ? 'var(--good)' : 'var(--bad)';
+        const ms = document.getElementById('marketStatus');
+        ms.textContent = d.holidayToday ? 'تعطیل' : d.marketOpenNow ? 'باز' : 'بسته';
+        ms.style.color = d.marketOpenNow ? 'var(--good)' : d.holidayToday ? 'var(--warn)' : 'var(--text-dim)';
+        const hs = document.getElementById('healthStatus');
+        if (d.health && d.health.consecutiveFailures >= 5) { hs.textContent = 'خراب'; hs.style.color = 'var(--bad)'; }
+        else if (d.pendingOutbox > 0) { hs.textContent = `${d.pendingOutbox} در صف`; hs.style.color = 'var(--warn)'; }
+        else { hs.textContent = 'سالم'; hs.style.color = 'var(--good)'; }
+        if (!d.telegramConfigured && !warnedTelegram) { warnedTelegram = true; showAlert('تلگرام تنظیم نشده.', 'warn', 12000); }
+        if (!d.adminRequired && !warnedToken) { warnedToken = true; showAlert('ADMIN_TOKEN تنظیم نشده.', 'warn', 12000); }
+        const u = await apiFetch(`${BACKEND_URL}/api/usage`);
+        document.getElementById('usageAllSymbols').textContent = `${u.total}/${u.totalLimit}`;
+        if (u.total >= u.totalLimit) showAlert('سهمیه‌ی روزانه‌ی API تمام شد.', 'error');
+    } catch (e) {
+        const bs = document.getElementById('backendStatus'); bs.textContent = 'قطع'; bs.style.color = 'var(--bad)';
+        showAlert('عدم دسترسی به سرور: ' + e.message);
     }
 }
 
-app.get('/api/timeframes', (req, res) => res.json(Object.keys(TF)));
-app.get('/api/strategies', (req, res) => res.json(Object.values(STRATEGIES).map(s => ({ id: s.id, name: s.name, defaultTimeframe: s.defaultTimeframe, htfTimeframe: s.htfTimeframe || '1d', defaultParams: s.defaultParams, indicators: s.indicators }))));
-app.get('/api/candles/:symbol/:timeframe', async (req, res, next) => {
-    const { symbol, timeframe } = req.params; if (!TF[timeframe]) return res.status(400).json({ error: 'تایم‌فریم نامعتبر' });
-    try { res.json(await getCandles(symbol, timeframe)); } catch (e) { next(e); }
-});
-// داده‌ی کامل نمودار برای یک تنظیم: کندل‌ها + تعداد بسته‌شده + کندل‌های تایم‌فریم بالا
-app.get('/api/chart-data/:configId', async (req, res, next) => {
-    try {
-        const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
-        if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
-        const htfTf = cfg.htfTimeframe || '1d';
-        const candles = await getCandlesFull(cfg.symbol, cfg.timeframe);
-        const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
-        res.json({ config: cfg, candles, closedCount: closedOnly(candles, cfg.timeframe).length, htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
-    } catch (e) { next(e); }
-});
-
-// ---------------- وارد کردن تاریخچه‌ی روزانه از BrsApi History (سهمیه‌ی ۱۰ در روز به‌ازای هر کلید) ----------------
-// تبدیل تاریخ شمسی (مثل 1403-08-08) به میلادی — بدون نیاز به پکیج جانبی
-function jalaliToGregorian(jy, jm, jd) {
-    let gy; jy += 1595;
-    let days = -355668 + (365 * jy) + (Math.floor(jy / 33) * 8) + Math.floor(((jy % 33) + 3) / 4) + jd + ((jm < 7) ? (jm - 1) * 31 : ((jm - 7) * 30) + 186);
-    gy = 400 * Math.floor(days / 146097); days %= 146097;
-    if (days > 36524) { gy += 100 * Math.floor(--days / 36524); days %= 36524; if (days >= 365) days++; }
-    gy += 4 * Math.floor(days / 1461); days %= 1461;
-    if (days > 365) { gy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
-    let gd = days + 1;
-    const sal_a = [0, 31, ((gy % 4 === 0 && gy % 100 !== 0) || (gy % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let gm; for (gm = 0; gm < 13; gm++) { const v = sal_a[gm]; if (gd <= v) break; gd -= v; }
-    return { gy, gm, gd };
-}
-function parseJalaliDate(s) {
-    const [jy, jm, jd] = String(s || '').split('-').map(Number);
-    if (!jy || !jm || !jd) return null;
-    const { gy, gm, gd } = jalaliToGregorian(jy, jm, jd);
-    return tehranPartsToUTCDate(gy, gm, gd, 0, 0);
-}
-async function importDailyHistory(symbol) {
-    if (!API_KEYS.length) throw new Error('هیچ کلید BrsApi تنظیم نشده است.');
-    const picked = await acquireApiKey('history', HISTORY_PER_KEY_LIMIT);
-    if (!picked) throw new Error('سهمیه‌ی روزانه‌ی دیتای تاریخی (۱۰ درخواست به‌ازای هر کلید) تمام شده است؛ فردا دوباره امتحان کنید.');
-    const r = await fetch(`https://Api.BrsApi.ir/Tsetmc/History.php?key=${picked.key}&type=0&l18=${encodeURIComponent(symbol)}`, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, timeout: 20000 });
-    if (!r.ok) throw new Error(`HTTP ${r.status} (کلید ${picked.index + 1})`);
-    const data = await r.json();
-    if (!Array.isArray(data) || !data.length) throw new Error('داده‌ای برای این نماد یافت نشد (نام نماد را بررسی کنید)');
-    const col = getDB().collection('candles_daily'); let added = 0;
-    for (const row of data) {
-        const time = parseJalaliDate(row.date); if (!time) continue;
-        const close = +row.pl || +row.pc || 0; if (!(close > 0)) continue;
-        const doc = { symbol, time, open: +row.pf || close, high: +row.pmax || close, low: +row.pmin || close, close, volume: +row.tvol || 0, source: 'brsapi-history' };
-        const res = await col.updateOne({ symbol, time }, { $setOnInsert: doc }, { upsert: true });
-        if (res.upsertedCount) added++;
-    }
-    return { added, total: data.length };
-}
-app.post('/api/import-daily/:symbol', async (req, res) => {
-    try { res.json({ success: true, ...(await importDailyHistory(req.params.symbol)) }); }
-    catch (e) { console.error('❌ import-daily:', e.message); res.status(400).json({ error: e.message }); }
-});
-
-// ---------------- نمادهای زیر نظر ----------------
-app.get('/api/monitored-symbols', async (req, res, next) => {
-    try {
-        const db = getDB();
-        const [symbols, counts, dcounts] = await Promise.all([
-            db.collection('monitored_symbols').find({}).sort({ addedAt: 1 }).toArray(),
-            db.collection('candles_base').aggregate([{ $group: { _id: '$symbol', c: { $sum: 1 } } }]).toArray(),
-            db.collection('candles_daily').aggregate([{ $group: { _id: '$symbol', c: { $sum: 1 } } }]).toArray()
-        ]);
-        const cm = new Map(counts.map(c => [c._id, c.c])), dm = new Map(dcounts.map(c => [c._id, c.c]));
-        res.json(symbols.map(s => ({ ...s, candleCount: cm.get(s.symbol) || 0, dailyCount: dm.get(s.symbol) || 0 })));
-    } catch (e) { next(e); }
-});
-app.post('/api/monitored-symbols', async (req, res, next) => {
-    try {
-        const { symbol } = req.body; if (!symbol) return res.status(400).json({ error: 'symbol الزامی است' });
-        const db = getDB();
-        if (await db.collection('monitored_symbols').findOne({ symbol })) return res.status(400).json({ error: 'این نماد قبلاً اضافه شده است' });
-        const doc = { symbol, addedAt: new Date() }; const r = await db.collection('monitored_symbols').insertOne(doc);
-        res.json({ _id: r.insertedId, ...doc });
-    } catch (e) { next(e); }
-});
-app.delete('/api/monitored-symbols/:id', async (req, res, next) => {
-    try {
-        const db = getDB(); const doc = await db.collection('monitored_symbols').findOne({ _id: new ObjectId(req.params.id) });
-        if (!doc) return res.status(404).json({ error: 'یافت نشد' });
-        const n = await db.collection('strategy_configs').countDocuments({ symbol: doc.symbol });
-        if (n) return res.status(400).json({ error: `این نماد در ${n} تنظیم استفاده شده است.` });
-        await db.collection('monitored_symbols').deleteOne({ _id: doc._id }); res.json({ success: true });
-    } catch (e) { next(e); }
-});
-
-// ---------------- تنظیمات استراتژی ----------------
-app.get('/api/strategy-configs', async (req, res, next) => { try { res.json(await getDB().collection('strategy_configs').find({}).sort({ createdAt: 1 }).toArray()); } catch (e) { next(e); } });
-app.post('/api/strategy-configs', async (req, res, next) => {
-    try {
-        const { symbol, strategyId, timeframe, htfTimeframe, candleType, params, enabled } = req.body;
-        if (!symbol || !STRATEGIES[strategyId]) return res.status(400).json({ error: 'نماد یا استراتژی نامعتبر' });
-        if (!TF[timeframe]) return res.status(400).json({ error: 'تایم‌فریم نامعتبر' });
-        const htf = htfTimeframe || STRATEGIES[strategyId].htfTimeframe || '1d';
-        if (!TF[htf] || TF[htf] <= TF[timeframe]) return res.status(400).json({ error: 'تایم‌فریم بالا باید بزرگ‌تر از تایم‌فریم ورود باشد' });
-        const db = getDB();
-        if (!await db.collection('monitored_symbols').findOne({ symbol })) return res.status(400).json({ error: 'ابتدا نماد را به لیست زیر نظر اضافه کنید.' });
-        const doc = { symbol, strategyId, timeframe, htfTimeframe: htf, candleType: candleType === 'simple' ? 'simple' : 'heikin', params: { ...STRATEGIES[strategyId].defaultParams, ...(params || {}) }, enabled: enabled !== false, createdAt: new Date() };
-        const r = await db.collection('strategy_configs').insertOne(doc); res.json({ _id: r.insertedId, ...doc });
-    } catch (e) { next(e); }
-});
-app.put('/api/strategy-configs/:id', async (req, res, next) => {
-    try {
-        const upd = {}; if (req.body.params !== undefined) upd.params = req.body.params; if (req.body.enabled !== undefined) upd.enabled = req.body.enabled;
-        await getDB().collection('strategy_configs').updateOne({ _id: new ObjectId(req.params.id) }, { $set: upd }); res.json({ success: true });
-    } catch (e) { next(e); }
-});
-app.delete('/api/strategy-configs/:id', async (req, res, next) => {
-    try {
-        const db = getDB(); await db.collection('strategy_configs').deleteOne({ _id: new ObjectId(req.params.id) });
-        await db.collection('signals_state').deleteOne({ configId: req.params.id }); res.json({ success: true });
-    } catch (e) { next(e); }
-});
-
-// ---------------- وضعیت / تاریخچه / معاملات ----------------
-app.get('/api/status', async (req, res, next) => { try { res.json(await getDB().collection('signals_state').find({}).toArray()); } catch (e) { next(e); } });
-app.get('/api/signal-history', async (req, res, next) => { try { res.json(await getDB().collection('signal_history').find({}).sort({ createdAt: -1 }).limit(300).toArray()); } catch (e) { next(e); } });
-app.delete('/api/signal-history', async (req, res, next) => { try { await getDB().collection('signal_history').deleteMany({}); res.json({ success: true }); } catch (e) { next(e); } });
-
-// بک‌تست روی کل داده‌ی موجود (کندل‌های بسته)
-async function computeStockBacktestTrades(cfg) {
-    const def = STRATEGIES[cfg.strategyId]; const htfTf = cfg.htfTimeframe || '1d';
-    const candles = closedOnly(await getCandlesFull(cfg.symbol, cfg.timeframe), cfg.timeframe);
-    const htf = closedOnly(await getCandlesFull(cfg.symbol, htfTf), htfTf);
-    const result = def.run(candles, { ...cfg.params, candleType: cfg.candleType }, { htfCandles: htf, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } });
-    const closeAt = new Map(candles.map((c, i) => [c.time, { close: c.close, i }]));
-    const trades = []; let open = null;
-    for (const s of result.signals) {
-        const c = closeAt.get(s.time); if (!c) continue;
-        if (s.signalType === 'BUY' && !open) open = { entryTime: s.time, entryPrice: c.close, entryIdx: c.i, reason: s.reason, status: 'open' };
-        else if (s.signalType === 'EXIT_LONG' && open) { trades.push({ ...open, exitTime: s.time, exitPrice: c.close, pnlPct: (c.close / open.entryPrice - 1) * 100, bars: c.i - open.entryIdx, exitReason: s.reason, status: 'closed' }); open = null; }
-    }
-    if (open) trades.push(open);
-    return { candles, htf, trades };
-}
-
-app.get('/api/backtest-option/:configId', async (req, res, next) => {
-    try {
-        const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
-        if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
-        const { trades } = await computeStockBacktestTrades(cfg);
-        const closedTrades = trades.filter(t => t.status === 'closed');
-        const result = await Options.runApproxOptionBacktest(cfg.symbol, closedTrades);
-        res.json({ stockTradesCount: trades.length, stockClosedCount: closedTrades.length, ...result });
-    } catch (e) { next(e); }
-});
-
-// ---------------- ارزیابی استراتژی ----------------
-async function evaluateStrategyConfig(config, marketInfo) {
-    const def = STRATEGIES[config.strategyId]; if (!def) return;
-    const db = getDB(), stateColl = db.collection('signals_state'), configId = config._id.toString();
-    const htfTf = config.htfTimeframe || def.htfTimeframe || '1d';
-    const candles = closedOnly(await getCandles(config.symbol, config.timeframe), config.timeframe);
-    const htfCandles = closedOnly(await getCandles(config.symbol, htfTf), htfTf);
-    const required = getRequiredCandles(config.strategyId, config.params);
-    const requiredHtf = Strat.getRequiredHtfCandles ? Strat.getRequiredHtfCandles(config.strategyId, config.params) : 0;
-    const info = marketInfo && marketInfo.get(config.symbol);
-    const base = { configId, symbol: config.symbol, strategyId: config.strategyId, timeframe: config.timeframe, htfTimeframe: htfTf, candleCount: candles.length, requiredCandles: required, htfCandleCount: htfCandles.length, requiredHtfCandles: requiredHtf, updatedAt: new Date(), queue: info ? info.queue : null, livePrice: info ? info.price : null };
-
-    if (candles.length < required || htfCandles.length < requiredHtf) {
-        await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: true, position: null } }, { upsert: true }); return;
-    }
-    let result;
-    try { result = def.run(candles, { ...config.params, candleType: config.candleType }, { htfCandles, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } }); }
-    catch (e) { console.error(`❌ استراتژی ${config.symbol}:`, e.message); return; }
-    const prev = await stateColl.findOne({ configId });
-    const latest = result.signals[result.signals.length - 1]; if (!latest) return;
-    const prevNotified = prev && prev.lastNotifiedTime || 0;
-    // آخرین سیگنال عمل‌پذیر که بعد از آخرین اعلان رخ داده (حداکثر ۵ کندل عقب‌تر)
-    let last = latest;
-    for (let i = result.signals.length - 1, k = 0; i >= 0 && k < 5; i--, k++) {
-        const s = result.signals[i];
-        if ((s.signalType === 'BUY' || s.signalType === 'EXIT_LONG') && s.time > prevNotified) { last = s; break; }
-    }
-    const late = last !== latest;
-    const lastPrice = candles[candles.length - 1].close;
-
-    await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: false, position: latest.position, indicators: latest.indicators, price: lastPrice, lastCandleTime: latest.time, htfTrend: result.htfTrend || null, reason: latest.reason || null } }, { upsert: true });
-
-    const label = `${config.symbol} | ${def.name} | ${config.timeframe}→${htfTf}`;
-    const lastHa = result.ha.find(h => h.time === last.time);
-    const incompleteTag = lastHa && lastHa.complete === false ? '\n⚠️ این کندل داده‌ی ناقص دارد — احتمال قطعی سرور یا توقف نماد' : '';
-    // ۱.۱: لغو سیگنال (موقعیت بدون سیگنال خروج ناپدید شد)
-    if (prev && prev.position === 'LONG' && latest.position !== 'LONG' && last.signalType !== 'EXIT_LONG') {
-        await notify(`⚠️ لغو سیگنال\n${label}\nموقعیت خرید قبلی در محاسبه‌ی جدید وجود ندارد. اگر آپشن خریده‌اید، بازبینی کنید.`);
-        await bumpDayStat('cancels');
-    }
-    const actionable = last.signalType === 'BUY' || last.signalType === 'EXIT_LONG';
-    const already = prev && prev.lastNotifiedTime === last.time && prev.lastNotifiedType === last.signalType;
-    if (!actionable || already) return;
-
-    const nowMin = minuteOfDay(getTehranParts());
-    const inWindow = nowMin >= ENTRY_START && nowMin <= ENTRY_END;
-    const queueTag = info && info.queue === 'buy' ? '\n⚠️ صف خرید — آپشن احتمالاً گران شده' : info && info.queue === 'sell' ? '\n⚠️ صف فروش' : '';
-    const windowTag = last.signalType === 'BUY' && !inWindow ? `\n⏸ خارج از بازه‌ی ورود (${fmtMin(ENTRY_START)}–${fmtMin(ENTRY_END)}) — توصیه: ورود نکن` : '';
-    const title = (last.signalType === 'BUY' ? '📈 سیگنال خرید (کال)' : '🔔 خروج از خرید (بستن کال)') + (late ? ' ⏰ (با تأخیر — کندل قبلاً بسته شده)' : '');
-    const text = `${title}\n${label}\nروند ${htfTf}: ${result.htfTrend || '-'}\nقیمت بسته‌شدن: ${lastPrice.toLocaleString()}${info ? ` | لحظه‌ای: ${info.price.toLocaleString()}` : ''}\nدلیل: ${last.reason || '-'}${queueTag}${windowTag}${incompleteTag}`;
-    await notify(text);
-    await stateColl.updateOne({ configId }, { $set: { lastNotifiedTime: last.time, lastNotifiedType: last.signalType } });
-    await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, incomplete: !!(lastHa && lastHa.complete === false), createdAt: new Date() });
-    await bumpDayStat('signals');
-
-    if (last.signalType === 'BUY') {
-        if (inWindow && !(info && info.queue === 'buy')) {
-            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId: null }); }
-            catch (e) { console.error('❌ انتخاب آپشن:', e.message); await notify(`⚠️ انتخاب قرارداد آپشن برای ${config.symbol} ناموفق: ${e.message}`); }
-        } else await notify(`ℹ️ ${config.symbol}: به‌دلیل ${!inWindow ? 'خارج از بازه‌ی ورود' : 'صف خرید'} قرارداد آپشن پیشنهاد نشد.`);
-    }
-}
-async function evaluateAll(marketInfo) {
-    const configs = await getDB().collection('strategy_configs').find({ enabled: true }).toArray();
-    for (const c of configs) await evaluateStrategyConfig(c, marketInfo);
-    return configs.length;
-}
-
-// ---------------- تیک اصلی ----------------
-const lastSnap = new Map(); let tickRunning = false;
-async function tick() {
-    if (tickRunning) return; tickRunning = true;
-    try {
-        const db = getDB();
-        const monitored = await db.collection('monitored_symbols').find({}).toArray();
-        if (!monitored.length) return;
-        const tehran = getTehranParts();                 // ۱.۸-۱: زمان قبل از fetch
-        const bucket1 = getBucketTime(tehran, 1), dayTime = dayStartUTC(tehran);
-
-        let raw; try { raw = await fetchAllSymbolsRaw(); } catch (e) { await recordTickFailure(e.message); return; }
-        await updateSymbolsCacheFromRaw(raw);
-
-        // ۱.۷: تشخیص تعطیلی
-        const active = raw.filter(s => +s.tno > 0).length;
-        if (minuteOfDay(tehran) >= SESSION_START + 10) {
-            if (active < 20) { if (++inactiveTicks >= 5) { await markHoliday(tehran); return; } } else inactiveTicks = 0;
-        }
-        const rawMap = new Map(); raw.forEach(s => { if (s.l18) rawMap.set(s.l18, s); });
-        const marketInfo = new Map();
-        for (const m of monitored) {
-            const s = rawMap.get(m.symbol); if (!s) continue;
-            const price = +s.pl; if (!price) continue;
-            const tno = +s.tno || 0, tvol = +s.tvol || 0, tmax = +s.tmax || 0, tmin = +s.tmin || 0;
-            const atUpper = tmax > 0 && price >= tmax, atLower = tmin > 0 && price <= tmin;
-            const prev = lastSnap.get(m.symbol);
-            const traded = !prev || tno !== prev.tno;
-            const volDelta = prev && tvol >= prev.tvol ? tvol - prev.tvol : 0;
-            lastSnap.set(m.symbol, { tno, tvol });
-            marketInfo.set(m.symbol, { price, queue: atUpper ? 'buy' : atLower ? 'sell' : null });
-            if (!traded && !atUpper && !atLower) continue;   // ۱.۵: متوقف/بدون معامله → کندل نساز
-            await upsertLiveCandle(m.symbol, bucket1, price, volDelta);
-            await upsertDailyCandle(m.symbol, dayTime, s);
-        }
-        const n = await evaluateAll(marketInfo);
+let searchTimeout = null, selectedSymbol = null;
+document.getElementById('symbolSearchInput').addEventListener('input', e => {
+    selectedSymbol = null; const q = e.target.value.trim(); clearTimeout(searchTimeout);
+    const list = document.getElementById('autocompleteList'); if (!q) { list.style.display = 'none'; return; }
+    searchTimeout = setTimeout(async () => {
         try {
-            const openOpt = await Options.openPositionsCount();
-            if (tehran.minute % 5 === 0 || openOpt > 0) {
-                const chain = await Options.fetchChain(30000);
-                const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
-                if (tehran.minute % 5 === 0) await Options.storeSnapshots(chain, mset);
-                await Options.managePositions(chain);
-            }
-        } catch (e) { console.error('❌ آپشن:', e.message); }
-        await flushOutbox();
-        await recordTickSuccess();
-        console.log(`⏱ ${tehran.hour}:${String(tehran.minute).padStart(2, '0')} | ${monitored.length} نماد | ${n} استراتژی | فعال بازار: ${active}`);
-    } catch (e) { await recordTickFailure(e.message); }
-    finally { tickRunning = false; }
+            const r = await apiFetch(`${BACKEND_URL}/api/symbols/search?q=${encodeURIComponent(q)}`);
+            if (!r.length) { list.style.display = 'none'; return; }
+            list.innerHTML = r.map(x => `<div onclick="selectSymbol('${esc(x.symbol)}')">${esc(x.symbol)} <small>${esc(x.name||'')}</small></div>`).join(''); list.style.display = 'block';
+        } catch (e) { showAlert('خطا در جستجو: ' + e.message); }
+    }, 300);
+});
+function selectSymbol(s) { selectedSymbol = s; document.getElementById('symbolSearchInput').value = s; document.getElementById('autocompleteList').style.display = 'none'; }
+document.addEventListener('click', e => { if (!e.target.closest('.field')) document.getElementById('autocompleteList').style.display = 'none'; });
+
+async function addMonitoredSymbol() {
+    if (!selectedSymbol) return showAlert('یک نماد را از لیست انتخاب کنید.', 'warn');
+    try {
+        await apiFetch(`${BACKEND_URL}/api/monitored-symbols`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ symbol: selectedSymbol }) });
+        showAlert(`«${selectedSymbol}» اضافه شد.`, 'success', 4000);
+        document.getElementById('symbolSearchInput').value = ''; selectedSymbol = null; await loadMonitoredSymbols();
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function loadMonitoredSymbols() {
+    try { monitoredSymbols = await apiFetch(`${BACKEND_URL}/api/monitored-symbols`); renderMonitoredSymbols(); renderConfigSymbolOptions(); }
+    catch (e) { showAlert('خطا در بارگذاری نمادها: ' + e.message); }
+}
+function renderMonitoredSymbols() {
+    const g = document.getElementById('symbolGrid'); document.getElementById('symbolCountLabel').textContent = monitoredSymbols.length;
+    if (!monitoredSymbols.length) return g.innerHTML = '<div class="empty-note">نمادی اضافه نشده است</div>';
+    g.innerHTML = monitoredSymbols.map(s => `<div class="chip">
+        <span class="chip-sym" title="${esc(s.symbol)}">${esc(s.symbol)}</span>
+        <span class="chip-cnt" title="کندل دقیقه‌ای / روزانه">${s.candleCount} · ${s.dailyCount}d</span>
+        <button class="chip-ic" title="زنجیره‌ی آپشن" onclick="viewChain('${esc(s.symbol)}')">زنجیره</button>
+        <button class="chip-ic" title="دریافت تاریخچه‌ی روزانه" onclick="importDaily('${esc(s.symbol)}')">تاریخچه</button>
+        <button class="chip-ic x" title="حذف" onclick="deleteMonitoredSymbol('${s._id}','${esc(s.symbol)}')">×</button></div>`).join('');
+}
+async function deleteMonitoredSymbol(id, sym) {
+    if (!confirm(`نماد «${sym}» حذف شود؟`)) return;
+    try { await apiFetch(`${BACKEND_URL}/api/monitored-symbols/${id}`, { method:'DELETE' }); await loadMonitoredSymbols(); } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function importDaily(sym) {
+    showAlert(`در حال دریافت تاریخچه‌ی «${sym}»...`, 'info', 4000);
+    try {
+        const r = await apiFetch(`${BACKEND_URL}/api/import-daily/${encodeURIComponent(sym)}`, { method:'POST' }, 0);
+        showAlert(`«${sym}»: ${r.added} کندل روزانه اضافه شد (از ${r.total}).`, 'success', 8000);
+        await Promise.all([loadMonitoredSymbols(), loadConfigs()]);
+    } catch (e) { showAlert('خطا: ' + e.message, 'error', 10000); }
 }
 
-app.post('/api/evaluate-now', async (req, res, next) => {
-    try { await tick(); res.json({ success: true, lastTickAt: health.lastTickAt, lastError: health.lastError, consecutiveFailures: health.consecutiveFailures }); } catch (e) { next(e); }
-});
-
-// ---------------- وضعیت ----------------
-app.get('/', async (req, res) => {
-    let pendingOutbox = 0;
+async function loadTimeframes() {
+    const tfs = await apiFetch(`${BACKEND_URL}/api/timeframes`);
+    document.getElementById('timeframeSelect').innerHTML = tfs.map(t => `<option value="${t}">${TF_LABELS[t]||t}</option>`).join('');
+    document.getElementById('htfSelect').innerHTML = tfs.filter(t => TF_MIN[t] >= 15).map(t => `<option value="${t}">${TF_LABELS[t]||t}</option>`).join('');
+}
+async function loadStrategies() {
+    strategiesInfo = await apiFetch(`${BACKEND_URL}/api/strategies`);
+    const sel = document.getElementById('strategySelect'); sel.innerHTML = strategiesInfo.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+    onStrategyChange(); sel.addEventListener('change', onStrategyChange);
+}
+function onStrategyChange() {
+    const s = strategiesInfo.find(x => x.id === document.getElementById('strategySelect').value); if (!s) return;
+    const c = document.getElementById('paramsContainer'); c.innerHTML = '';
+    Object.entries(s.defaultParams).forEach(([k, v]) => c.innerHTML += `<div class="field"><label>${PARAM_LABELS[k]||k}</label><input type="number" step="any" id="param_${k}" value="${v}"></div>`);
+    document.getElementById('timeframeSelect').value = s.defaultTimeframe;
+    document.getElementById('htfSelect').value = s.htfTimeframe || '1d';
+}
+function renderConfigSymbolOptions() {
+    document.getElementById('configSymbolSelect').innerHTML = monitoredSymbols.length ? monitoredSymbols.map(s => `<option value="${esc(s.symbol)}">${esc(s.symbol)}</option>`).join('') : '<option value="">-- ابتدا نماد اضافه کنید --</option>';
+}
+async function addStrategyConfig() {
+    const symbol = document.getElementById('configSymbolSelect').value; if (!symbol) return showAlert('ابتدا نماد اضافه کنید.', 'warn');
+    const strategyId = document.getElementById('strategySelect').value, s = strategiesInfo.find(x => x.id === strategyId);
+    const timeframe = document.getElementById('timeframeSelect').value, htfTimeframe = document.getElementById('htfSelect').value;
+    if (TF_MIN[htfTimeframe] <= TF_MIN[timeframe]) return showAlert('تایم‌فریم بالا باید بزرگ‌تر باشد.', 'warn');
+    const params = {}; Object.keys(s.defaultParams).forEach(k => { const el = document.getElementById(`param_${k}`); if (el) params[k] = parseFloat(el.value); });
     try {
-        pendingOutbox = await getDB().collection('telegram_outbox').countDocuments({
-            sentAt: null,
-            attempts: { $lt: 120 },
-            createdAt: { $lt: new Date(Date.now() - 120000) }
+        await apiFetch(`${BACKEND_URL}/api/strategy-configs`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ symbol, strategyId, timeframe, htfTimeframe, candleType: document.getElementById('candleTypeSelect').value, params, enabled:true }) });
+        showAlert(`استراتژی «${s.name}» برای «${symbol}» ایجاد شد.`, 'success', 4000); await loadConfigs();
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function loadConfigs() {
+    try {
+        const [c, st] = await Promise.all([apiFetch(`${BACKEND_URL}/api/strategy-configs`), apiFetch(`${BACKEND_URL}/api/status`)]);
+        configs = c; statusMap = {}; st.forEach(x => statusMap[x.configId] = x); renderConfigs();
+    } catch (e) { showAlert('خطا در بارگذاری تنظیمات: ' + e.message); }
+}
+function renderConfigs() {
+    const tb = document.getElementById('configsBody');
+    if (!configs.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">تنظیمی ایجاد نشده است</td></tr>';
+    const groups = {};
+    configs.forEach(c => { if (!groups[c.symbol]) groups[c.symbol] = []; groups[c.symbol].push(c); });
+    let html = '';
+    for (const symbol of Object.keys(groups)) {
+        const items = groups[symbol];
+        const insufficient = items.some(it => { const st = statusMap[it._id]; return st && st.insufficientData; });
+        const insufBadge = insufficient ? '<br><span class="badge warn" style="margin-top:3px;">داده ناکافی</span>' : '';
+        items.forEach((it, idx) => {
+            const id = it._id, st = statusMap[id], s = strategiesInfo.find(x => x.id === it.strategyId);
+            const name = s ? s.name : it.strategyId;
+            const tf = `${TF_LABELS[it.timeframe]||it.timeframe} → ${TF_LABELS[it.htfTimeframe||'1d']}`;
+            const candle = it.candleType === 'simple' ? 'ساده' : 'HA';
+            const trend = st && st.htfTrend ? trendBadge(st.htfTrend) : '<span class="badge none">-</span>';
+            let posBadge = '<span class="badge none">بدون موقعیت</span>';
+            if (st && !st.insufficientData && st.position === 'LONG') posBadge = '<span class="badge long">در کال</span>';
+            const queue = st && st.queue === 'buy' ? ' <span class="badge warn">صف خرید</span>' : st && st.queue === 'sell' ? ' <span class="badge short">صف فروش</span>' : '';
+            const active = `<input type="checkbox" ${it.enabled?'checked':''} onchange="toggleConfigEnabled('${id}', this.checked)">`;
+            const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny outline" onclick="showKandelDetail('${id}')">جزئیات</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
+            const symbolCell = idx === 0 ? `<td rowspan="${items.length}" style="font-weight:600; background:var(--bg-input); border-left:2px solid var(--accent); vertical-align:middle;"><b>${esc(symbol)}</b>${insufBadge}</td>` : '';
+            const rowClass = idx === 0 ? 'symbol-start' : '';
+            html += `<tr class="${rowClass}">${symbolCell}<td>${esc(name)}${queue}</td><td>${tf}</td><td>${candle}</td><td>${trend}</td><td>${posBadge}</td><td>${active}</td><td>${actions}</td></tr>`;
         });
-    } catch (e) {}
-    const t = getTehranParts();
-    res.json({ status: 'ok', version: SERVER_VERSION, startedAt: STARTED_AT, commit: process.env.RENDER_GIT_COMMIT || null, apiKeysConfigured: API_KEYS.length, adminRequired: !!ADMIN_TOKEN, telegramConfigured: !!(TELEGRAM_TOKEN && TELEGRAM_CHAT_ID),
-        symbolsCached: symbolsCache.length, marketOpenNow: isMarketOpen(t), holidayToday: holidayDate === todayDateString(t),
-        entryWindow: `${fmtMin(ENTRY_START)}-${fmtMin(ENTRY_END)}`, health: { ...health }, pendingOutbox });
-});
-app.get('/api/logs', async (req, res, next) => {
+    }
+    tb.innerHTML = html;
+}
+async function toggleConfigEnabled(id, en) { try { await apiFetch(`${BACKEND_URL}/api/strategy-configs/${id}`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ enabled: en }) }); } catch (e) { showAlert('خطا: ' + e.message); } }
+async function deleteConfig(id) {
+    if (!confirm('این تنظیم حذف شود؟')) return;
+    try { await apiFetch(`${BACKEND_URL}/api/strategy-configs/${id}`, { method:'DELETE' }); if (selectedConfigId === id) selectedConfigId = null; await loadConfigs(); } catch (e) { showAlert('خطا: ' + e.message); }
+}
+function showKandelDetail(id) {
+    const it = configs.find(c => c._id === id); if (!it) return;
+    const st = statusMap[id], s = strategiesInfo.find(x => x.id === it.strategyId);
+    const candleCount = st ? (st.candleCount || 0) : 0;
+    const required = st ? (st.requiredCandles || 0) : 0;
+    const htfCount = st ? (st.htfCandleCount || 0) : 0;
+    const htfRequired = st ? (st.requiredHtfCandles || 0) : 0;
+    const dataReady = st && !st.insufficientData;
+    openModal(`جزئیات ${it.symbol} — ${s?s.name:it.strategyId}`, `
+        <div class="stats-grid">
+            <div class="stat"><small>کندل ${TF_LABELS[it.timeframe]}</small><b>${candleCount} / ${required}</b></div>
+            <div class="stat"><small>کندل ${TF_LABELS[it.htfTimeframe||'1d']}</small><b>${htfCount} / ${htfRequired}</b></div>
+            <div class="stat"><small>وضعیت</small><b style="color:${dataReady?'var(--good)':'var(--warn)'};">${dataReady?'آماده‌ی ارزیابی':'منتظر داده'}</b></div>
+            <div class="stat"><small>آخرین به‌روزرسانی</small><b>${st && st.updatedAt ? new Date(st.updatedAt).toLocaleTimeString('fa-IR') : '-'}</b></div>
+        </div>`);
+}
+
+async function runOptionBacktest(id) {
+    const it = configs.find(c => c._id === id); if (!it) return;
+    openModal(`بک‌تست آپشن (تقریبی) ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال محاسبه...</div>');
     try {
-        if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN) return res.status(401).json({ error: 'توکن ادمین نامعتبر است' });
-        const limit = Math.min(+req.query.limit || 200, 1000);
-        if (req.query.source === 'db') return res.json({ logs: await getDB().collection('logs').find({}).sort({ at: -1 }).limit(limit).toArray() });
-        res.json({ logs: Log.recent(limit, req.query.level || undefined) });
-    } catch (e) { next(e); }
-});
-Options.registerRoutes(app, ObjectId);
-
-app.use((req, res) => { Log.push('warn', `404 ${req.method} ${req.originalUrl}`); res.status(404).json({ error: 'مسیر یافت نشد' }); });
-app.use((err, req, res, next) => { console.error('❌', err.message); res.status(500).json({ error: err.message || 'خطای داخلی' }); });
-
-// ---------------- راه‌اندازی ----------------
-async function ensureIndexes() {
-    const db = getDB();
-    await db.collection('candles_daily').createIndex({ symbol: 1, time: 1 }, { unique: true });
-    await db.collection('telegram_outbox').createIndex({ sentAt: 1, createdAt: 1 });
-    // بدون TTL — پیام‌های قدیمی به‌جای حذف، توسط archive.js منتقل می‌شوند
-    try { await db.collection('telegram_outbox').dropIndex('sentAt_1'); } catch (e) {}
-    try { await db.collection('telegram_outbox').dropIndex('createdAt_1'); } catch (e) {}
-    await db.collection('trades').createIndex({ configId: 1, status: 1 });
-    await Log.ensureIndexes(db);
+        const r = await apiFetch(`${BACKEND_URL}/api/backtest-option/${id}`);
+        const a = r.assumptions;
+        const diag = r.diagnostic ? `<div class="msg-warn" style="display:block;background:rgba(217,83,79,.1);border-color:var(--bad);color:var(--bad);">${esc(r.diagnostic)}</div>` : '';
+        const head = diag + `<div class="msg-warn" style="display:block;">کاملاً تقریبی: قرارداد فرضی ATM، سررسید فرضی ${a.assumedMaturityDays} روز، IV فرضی = ${a.ivMultiplier}×HV، اسپرد فرضی ${a.spreadPct}٪.</div>
+            <div class="stats-grid">
+                <div class="stat"><small>معاملات سهم پایه</small><b>${r.stockTradesCount||0}</b></div>
+                <div class="stat"><small>معاملات بسته‌شده</small><b>${r.stockClosedCount||0}</b></div>
+                <div class="stat"><small>معامله آپشن</small><b>${r.stats.count}</b></div>
+                <div class="stat"><small>وین‌ریت</small><b>${r.stats.count ? r.stats.winRate.toFixed(0)+'٪' : '-'}</b></div>
+                <div class="stat"><small>بازده کل</small><b>${r.stats.count ? pct(r.stats.totalPnl) : '-'}</b></div>
+                <div class="stat"><small>میانگین</small><b>${r.stats.count ? pct(r.stats.avgPnl) : '-'}</b></div>
+                <div class="stat"><small>Profit Factor</small><b>${r.stats.count ? (r.stats.profitFactor===Infinity?'∞':r.stats.profitFactor.toFixed(2)) : '-'}</b></div>
+            </div>`;
+        const rows = r.trades.length ? r.trades.slice().reverse().map(t => `<tr><td>${fmtT(t.entryTime)}</td><td>${fmtN(t.stockEntry)}→${fmtN(t.stockExit)}</td><td>${fmtN(t.strike)}</td><td>${(t.hv*100).toFixed(0)}٪</td><td>${t.entryDelta.toFixed(2)}</td><td>${fmtN(t.optionEntry)}→${fmtN(t.optionExit)}</td><td>${pct(t.pnlPct)}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="8">معامله‌ای یافت نشد</td></tr>';
+        openModal(`بک‌تست آپشن ${it.symbol}`, head + `<div class="table-responsive"><table class="data-table"><thead><tr><th>ورود</th><th>سهم</th><th>اعمال</th><th>HV</th><th>دلتا</th><th>پرمیوم</th><th>بازده</th><th>خروج</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+    } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
-async function start() {
-    await connectDB();
-    Log.init(getDB);
-    Settings.init({ getDB });
-    await Settings.load();
-    await reloadEntryWindow();
-    Options.reloadFromSettings();
-    await ensureIndexes();
-    
-Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()), archiveStats: Archive.allArchiveStats });
-    await Options.ensureIndexes();
-    await backfillDailyFromBase();
-    await persistTfCandles().catch(e => console.error('❌ persistTfCandles:', e.message));
-    const hol = await getDB().collection('meta').findOne({ _id: 'holiday' }); if (hol) holidayDate = hol.date;
-    if (!await loadSymbolsCacheFromDB()) { try { await updateSymbolsCacheFromRaw(await fetchAllSymbolsRaw()); } catch (e) { console.error('❌ کش نمادها:', e.message); } }
-    if (!ADMIN_TOKEN) console.warn('⚠️ ADMIN_TOKEN تنظیم نشده؛ مسیرهای تغییردهنده باز هستند.');
 
-    cron.schedule('* * * * *', async () => {
-        const t = getTehranParts();
-        flushOutbox().catch(() => {});
-        if (!isMarketOpen(t)) return;
-        if (holidayDate === todayDateString(t)) {
-            if (t.minute % 5 !== 0) return;               // هر ۵ دقیقه یک بررسی مجدد
-            try {
-                const raw = await fetchAllSymbolsRaw();
-                if (raw.filter(s => +s.tno > 0).length >= 20) { holidayDate = null; inactiveTicks = 0; await getDB().collection('meta').deleteOne({ _id: 'holiday' }); await notify('🟢 بازار فعال شد؛ علامت تعطیلی برداشته شد.'); }
-                else return;
-            } catch (e) { return; }
+async function loadSignalHistory() {
+    try {
+        const h = await apiFetch(`${BACKEND_URL}/api/signal-history`), tb = document.getElementById('signalHistoryBody');
+        if (!h.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">سیگنالی ثبت نشده است</td></tr>';
+        tb.innerHTML = h.map(x => `<tr><td>${fmtT(x.time)}</td><td>${esc(x.symbol)}</td><td>${esc(x.strategyName||x.strategyId)} · ${TF_LABELS[x.timeframe]||''}</td><td>${SIGNAL_LABELS[x.signalType]||x.signalType}</td><td>${x.price?x.price.toLocaleString():'-'}</td><td>${trendBadge(x.htfTrend)}</td><td style="font-size:11px;">${esc(x.reason||'-')}</td>
+            <td>${x.queue==='buy'?'<span class="badge warn">صف خرید</span>':''}${x.signalType==='BUY'&&x.inWindow===false?'<span class="badge warn">خارج بازه</span>':''}${x.incomplete?'<span class="badge warn">ناقص</span>':''}</td></tr>`).join('');
+    } catch (e) { showAlert('خطا در تاریخچه: ' + e.message); }
+}
+async function clearSignalHistory() {
+    if (!confirm('کل تاریخچه پاک شود؟')) return;
+    try { await apiFetch(`${BACKEND_URL}/api/signal-history`, { method:'DELETE' }); await loadSignalHistory(); } catch (e) { showAlert('خطا: ' + e.message); }
+}
+
+function chartOpts(el, h) {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-card').trim();
+    const txt = getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim();
+    const grid = getComputedStyle(document.documentElement).getPropertyValue('--border').trim();
+    return { layout:{ background:{ color:bg }, textColor:txt, fontFamily:'Vazirmatn' }, grid:{ vertLines:{ color:grid }, horzLines:{ color:grid } }, timeScale:{ timeVisible:true, secondsVisible:false, tickMarkFormatter:fmtT }, localization:{ timeFormatter:fmtT }, width: el.clientWidth || 600, height: el.clientHeight || h };
+}
+function destroyCharts() { try { priceChart && priceChart.remove(); } catch {} try { panelChart && panelChart.remove(); } catch {} priceChart = panelChart = candleSeries = null; overlaySeries = {}; panelSeries = {}; chartConfigId = null; }
+function buildCharts(meta) {
+    destroyCharts();
+    document.getElementById('priceChartWrapper').innerHTML = '<div id="priceChart" style="height:400px;"></div>';
+    const pc = document.getElementById('priceChart');
+    priceChart = LightweightCharts.createChart(pc, chartOpts(pc, 400));
+    candleSeries = priceChart.addCandlestickSeries({ upColor:'#2ea88a', downColor:'#d9534f', borderVisible:false, wickUpColor:'#2ea88a', wickDownColor:'#d9534f', priceLineVisible:false, lastValueVisible:false });
+    meta.overlay.forEach((k, i) => overlaySeries[k] = priceChart.addLineSeries({ color: COLORS[i%COLORS.length], lineWidth:1.5, priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false, lineStyle: k==='stop'?2:0 }));
+    const pw = document.getElementById('panelChartWrapper');
+    if (meta.panel.length) {
+        pw.style.display = 'block';
+        document.getElementById('panelChart').innerHTML = '';
+        const rc = document.getElementById('panelChart'); panelChart = LightweightCharts.createChart(rc, chartOpts(rc, 180));
+        meta.panel.forEach((k, i) => panelSeries[k] = panelChart.addLineSeries({ color: COLORS[i%COLORS.length], lineWidth:2, priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false }));
+        document.getElementById('panelTitle').textContent = meta.panel.map(k => IND_LABELS[k]||k).join(' و ');
+        let lock = false; const link = (a, b) => a.subscribeVisibleLogicalRangeChange(r => { if (lock || !r) return; lock = true; try { b.setVisibleLogicalRange(r); } catch {} lock = false; });
+        link(priceChart.timeScale(), panelChart.timeScale()); link(panelChart.timeScale(), priceChart.timeScale());
+    } else pw.style.display = 'none';
+}
+function resetZoom() { priceChart && priceChart.timeScale().fitContent(); panelChart && panelChart.timeScale().fitContent(); }
+const seriesData = (signals, k) => signals.filter(s => s.indicators && typeof s.indicators[k] === 'number' && !Number.isNaN(s.indicators[k])).map(s => ({ time:s.time, value:s.indicators[k] }));
+
+async function viewChart(id) {
+    if (!window.TradingStrategies) return showAlert('کتابخانه‌ی استراتژی‌ها بارگذاری نشده.');
+    selectedConfigId = id;
+    const insuf = document.getElementById('insufficientDataMsg'), legend = document.getElementById('chartLegend');
+    try {
+        const d = await apiFetch(`${BACKEND_URL}/api/chart-data/${id}`);
+        const cfg = d.config, s = strategiesInfo.find(x => x.id === cfg.strategyId), def = TradingStrategies.STRATEGIES[cfg.strategyId];
+        document.getElementById('chartSymbolLabel').textContent = `- ${cfg.symbol} (${s?s.name:cfg.strategyId} / ${TF_LABELS[cfg.timeframe]} → ${TF_LABELS[d.htfTimeframe]})`;
+        const all = d.candles, closed = all.slice(0, d.closedCount);
+        if (closed.length < 2) {
+            destroyCharts(); document.getElementById('priceChartWrapper').innerHTML = '<div class="chart-placeholder">هنوز کندل بسته‌شده‌ی کافی ثبت نشده است.</div>';
+            document.getElementById('panelChartWrapper').style.display = 'none'; insuf.style.display = 'none'; legend.innerHTML = ''; return;
         }
-        await tick();
-    });
-    
-    // ارزیابی پس از بسته شدن بازار (کندل ۱۱:۰۰ یک‌ساعته و کندل روزانه) + ذخیره‌ی پایان‌روز آپشن
-    cron.schedule('32 12 * * 6,0,1,2,3', async () => {
-        if (holidayDate === todayDateString(getTehranParts())) return;
-        try {
-            await evaluateAll(null);
-            await persistTfCandles();
-            const monitored = await getDB().collection('monitored_symbols').find({}).toArray();
-            const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
-            const chain = await Options.fetchChain(0);
-            await Options.storeEOD(chain, mset);
-            await Options.managePositions(chain);
-            await flushOutbox();
-        } catch (e) { console.error('❌ ارزیابی پس از بسته شدن:', e.message); }
-    }, { timezone: 'Asia/Tehran' });
-    cron.schedule('35 12 * * 6,0,1,2,3', () => { if (holidayDate !== todayDateString(getTehranParts())) sendDailySummary().catch(() => {}); }, { timezone: 'Asia/Tehran' });
-    cron.schedule('0 10 * * 4', () => { sendWeeklyBackup().catch(e => console.error('❌ بکاپ هفتگی:', e.message)); }, { timezone: 'Asia/Tehran' });
-    app.listen(PORT, () => console.log(`🚀 ${SERVER_VERSION} | port ${PORT} | keys ${API_KEYS.length}`));
-    notify(`🚀 سرور ری‌استارت شد (${SERVER_VERSION})`).catch(() => {});
+        const required = TradingStrategies.getRequiredCandles(cfg.strategyId, cfg.params);
+        const requiredHtf = TradingStrategies.getRequiredHtfCandles ? TradingStrategies.getRequiredHtfCandles(cfg.strategyId, cfg.params) : 0;
+        const result = def.run(closed, { ...cfg.params, candleType: cfg.candleType }, { htfCandles: d.htfCandles, htfTimeframe: d.htfTimeframe, entryWindow: d.entryWindow });
+        const meta = def.indicators || { overlay:[], panel:[] };
+        const rebuild = chartConfigId !== id || !priceChart;
+        if (rebuild) buildCharts(meta);
+        const disp = result.ha.map(c => {
+            const o = { time:c.time, open:c.open, high:c.high, low:c.low, close:c.close };
+            if (c.complete === false) { o.color = 'rgba(201,151,61,.55)'; o.wickColor = 'rgba(201,151,61,.55)'; o.borderColor = 'rgba(201,151,61,.55)'; }
+            return o;
+        });
+        for (let i = closed.length; i < all.length; i++) {
+            const c = all[i], p = disp[disp.length-1];
+            let o = c.open, h = c.high, l = c.low, cl = c.close;
+            if (cfg.candleType !== 'simple' && p) { cl = (c.open+c.high+c.low+c.close)/4; o = (p.open+p.close)/2; h = Math.max(c.high,o,cl); l = Math.min(c.low,o,cl); }
+            const col = cl >= o ? 'rgba(46,168,138,.35)' : 'rgba(217,83,79,.35)';
+            disp.push({ time:c.time, open:o, high:h, low:l, close:cl, color:col, wickColor:col, borderColor:col });
+        }
+        candleSeries.setData(disp);
+        Object.entries(overlaySeries).forEach(([k, sr]) => sr.setData(seriesData(result.signals, k)));
+        Object.entries(panelSeries).forEach(([k, sr]) => sr.setData(seriesData(result.signals, k)));
+        candleSeries.setMarkers(result.signals.filter(x => x.signalType).map(x => x.signalType === 'BUY'
+            ? { time:x.time, position:'belowBar', color:'#2ea88a', shape:'arrowUp', text:'خرید' }
+            : { time:x.time, position:'aboveBar', color:'#c9973d', shape:'circle', text:'خروج' }));
+        legend.innerHTML = [...meta.overlay.map((k,i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${IND_LABELS[k]||k}</span>`),
+            ...meta.panel.map((k,i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${IND_LABELS[k]||k}</span>`),
+            `<span><i style="background:rgba(125,133,144,.5)"></i>کندل باز</span>`,
+            `<span><i style="background:rgba(201,151,61,.55)"></i>کندل ناقص</span>`,
+            result.htfTrend ? `<span>روند: ${trendBadge(result.htfTrend)}</span>` : ''].join('');
+        const msgs = [];
+        if (closed.length < required) msgs.push(`کندل ورود: ${closed.length} از ${required}`);
+        if (d.htfCandles.length < requiredHtf) msgs.push(`کندل بالا: ${d.htfCandles.length} از ${requiredHtf}`);
+        insuf.style.display = msgs.length ? 'block' : 'none'; insuf.textContent = msgs.length ? 'داده‌ی ناکافی — ' + msgs.join(' · ') : '';
+        if (rebuild) { chartConfigId = id; requestAnimationFrame(() => { priceChart && priceChart.applyOptions({ width: document.getElementById('priceChart').clientWidth }); panelChart && panelChart.applyOptions({ width: document.getElementById('panelChart').clientWidth }); resetZoom(); }); }
+    } catch (e) { showAlert('خطا در نمودار: ' + e.message); }
 }
-start().catch(e => { console.error('❌ راه‌اندازی:', e); process.exit(1); });
+
+async function openSettings() {
+    openModal('تنظیمات', '<div style="text-align:center;padding:30px;">در حال دریافت...</div>');
+    try {
+        const [t, o] = await Promise.all([apiFetch(`${BACKEND_URL}/api/trading-settings`), apiFetch(`${BACKEND_URL}/api/options/settings`)]);
+        window._tsKeys = Object.keys(t.defaults); window._optKeys = Object.keys(o.defaults);
+        const tradingFields = Object.keys(t.defaults).map(k => {
+            const isTime = k === 'ENTRY_START' || k === 'ENTRY_END';
+            return `<div class="field"><label>${TRADING_LABELS[k]||k}</label><input type="${isTime?'text':'number'}" ${isTime?'':'step="any"'} id="ts_${k}" value="${t.values[k]}"></div>`;
+        }).join('');
+        const optFields = Object.keys(o.defaults).map(k => `<div class="field"><label>${OPT_LABELS[k]||k}</label><input type="number" step="any" id="opt_${k}" value="${o.values[k]}"></div>`).join('');
+        openModal('تنظیمات', `
+            <div class="tabs">
+                <button class="tab active" onclick="switchSettingsTab('trading', this)">تنظیمات معاملات</button>
+                <button class="tab" onclick="switchSettingsTab('option', this)">تنظیمات آپشن</button>
+            </div>
+            <div id="tab-trading">
+                <div class="hint">این مقادیر بلافاصله اعمال می‌شوند.</div>
+                <div class="form-row">${tradingFields}</div>
+                <button class="btn" onclick="saveTradingSettings()">ذخیره</button>
+            </div>
+            <div id="tab-option" style="display:none;">
+                <div class="hint">کارمزد خرید ${(o.fees.buy*100).toFixed(2)}٪ · فروش ${(o.fees.sell*100).toFixed(2)}٪ · نرخ بدون ریسک ${(o.riskFree*100).toFixed(0)}٪</div>
+                <div class="form-row">${optFields}</div>
+                <button class="btn" onclick="saveOptionSettings()">ذخیره</button>
+            </div>`);
+    } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
+}
+function switchSettingsTab(which, btn) {
+    document.getElementById('tab-trading').style.display = which === 'trading' ? 'block' : 'none';
+    document.getElementById('tab-option').style.display = which === 'option' ? 'block' : 'none';
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+}
+async function saveTradingSettings() {
+    const body = {}; window._tsKeys.forEach(k => { const v = document.getElementById(`ts_${k}`).value.trim(); if (v !== '') body[k] = v; });
+    try { await apiFetch(`${BACKEND_URL}/api/trading-settings`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); showAlert('ذخیره شد.', 'success', 3000); await checkBackendStatus(); } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function saveOptionSettings() {
+    const body = {}; window._optKeys.forEach(k => body[k] = parseFloat(document.getElementById(`opt_${k}`).value));
+    try { await apiFetch(`${BACKEND_URL}/api/options/settings`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); showAlert('ذخیره شد.', 'success', 3000); } catch (e) { showAlert('خطا: ' + e.message); }
+}
+
+async function viewChain(sym) {
+    openModal(`زنجیره ${sym}`, '<div style="text-align:center;padding:30px;">در حال دریافت...</div>');
+    try {
+        const d = await apiFetch(`${BACKEND_URL}/api/options/chain/${encodeURIComponent(sym)}`);
+        if (!d.rows.length) {
+            let sug = '';
+            try { const u = await apiFetch(`${BACKEND_URL}/api/options/underlyings`); sug = `<div class="hint">نام‌های تطبیق: ${(d.matchedNames||[]).map(esc).join('، ')||'-'}</div><div class="hint">نمونه نام‌های موجود: ${u.underlyings.slice(0,40).map(x=>esc(x.underlying)).join('، ')}</div>`; } catch (e) {}
+            return openModal(`زنجیره ${sym}`, `<div class="empty-note">قراردادی یافت نشد.</div>${sug}<button class="btn small outline" style="margin-top:10px;" onclick="viewRawChain('${esc(sym)}')">API خام</button>`);
+        }
+        const rows = d.rows.map(r => {
+            const ivApiShow = r.ivApi ? (r.ivApi*100).toFixed(1)+'٪' : '-';
+            const ivCalc = r.iv ? (r.iv*100).toFixed(1)+'٪' : '-';
+            const hvApiShow = r.hvApi ? (r.hvApi*100).toFixed(1)+'٪' : '-';
+            const bsApi = r.theoApi ? fmtN(r.theoApi) : '-';
+            const bsCalc = r.theo ? fmtN(r.theo) : '-';
+            const delta = r.deltaApi ? r.deltaApi.toFixed(2) : (r.delta ? r.delta.toFixed(2) : '-');
+            const gamma = r.gammaApi ? r.gammaApi.toFixed(4) : (r.gamma ? r.gamma.toFixed(4) : '-');
+            const theta = r.thetaApi ? r.thetaApi.toFixed(1) : (r.thetaDay ? r.thetaDay.toFixed(1) : '-');
+            const vega = r.vegaApi ? r.vegaApi.toFixed(1) : (r.vega ? r.vega.toFixed(1) : '-');
+            return `<tr style="${r.reject.length?'opacity:.55':''}">
+                <td>${esc(r.symbol)}</td><td>${fmtN(r.strike)}</td><td>${r.expiry}</td><td>${r.daysLeft}</td>
+                <td>${fmtN(r.bid)} / ${fmtN(r.ask)}</td><td>${r.spreadPct===null?'-':r.spreadPct.toFixed(1)+'٪'}</td>
+                <td>${ivApiShow}<br><small>${ivCalc}</small></td>
+                <td>${hvApiShow}</td>
+                <td>${bsApi}<br><small>${bsCalc}</small></td>
+                <td>${delta}</td><td>${gamma}</td><td>${theta}</td><td>${vega}</td>
+                <td style="font-size:11px;">${r.reject.length?esc(r.reject.join('، ')):'<span class="badge long">قابل بررسی</span>'}</td>
+            </tr>`;
+        }).join('');
+        openModal(`زنجیره ${sym} — پایه ${fmtN(d.S)}${d.hv?` · HV محاسبه ${(d.hv*100).toFixed(0)}٪`:''} · داده ${d.chainAgeSec}s پیش`,
+            `<div style="margin-bottom:10px;"><button class="btn small outline" onclick="viewRawChain('${esc(sym)}')">API خام</button></div><div class="table-responsive"><table class="data-table"><thead><tr><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>روز</th><th>خرید / فروش</th><th>اسپرد</th><th>IV (API/محاسبه)</th><th>HV API</th><th>BS (API/محاسبه)</th><th>دلتا</th><th>گاما</th><th>تتا</th><th>وگا</th><th>وضعیت</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+    } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
+}
+async function viewRawChain(sym) {
+    openModal(`API خام ${sym}`, '<div style="text-align:center;padding:30px;">در حال دریافت...</div>');
+    try {
+        const d = await apiFetch(`${BACKEND_URL}/api/options/chain/${encodeURIComponent(sym)}?raw=1`);
+        if (!d.raw || !d.raw.length) return openModal(`API خام ${sym}`, `<div class="hint">نام‌های تطبیق: ${(d.matchedNames||[]).map(esc).join('، ')||'-'}</div><div class="empty-note">قراردادی یافت نشد.</div>`);
+        const cols = Object.keys(d.raw[0]);
+        const head = cols.map(c => `<th style="font-size:10px;">${esc(c)}</th>`).join('');
+        const body = d.raw.map(r => `<tr>${cols.map(c => { const v = r[c]; return `<td style="font-size:10.5px;">${typeof v === 'number' ? (Number.isFinite(v) ? (v % 1 === 0 ? v : v.toFixed(3)) : '-') : esc(v)}</td>`; }).join('')}</tr>`).join('');
+        openModal(`API خام ${sym} (${d.raw.length} قرارداد)`, `<div class="hint">نام‌های تطبیق: ${(d.matchedNames||[]).map(esc).join('، ')||'-'}</div><div class="table-responsive"><table class="data-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`);
+    } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
+}
+async function recommendOption(id) {
+    const it = configs.find(c => c._id === id); if (!it) return;
+    openModal(`پیشنهاد آپشن ${it.symbol}`, '<div style="text-align:center;padding:30px;">در حال محاسبه...</div>');
+    try {
+        const r = await apiFetch(`${BACKEND_URL}/api/options/recommend/${id}`);
+        const sc = r.scenario;
+        const head = `<div class="hint">سناریو: ورود ${fmtN(sc.entry)} · حد ضرر ${fmtN(sc.stop)} · هدف ${fmtN(sc.target)} · افق ~${sc.horizonDays} روز${sc.hv?` · HV ${(sc.hv*100).toFixed(0)}٪`:''}</div>`;
+        const picks = r.picks.length ? r.picks.map((p,i) => `<tr><td>${i+1}</td><td>${esc(p.symbol)}</td><td>${fmtN(p.strike)}</td><td>${p.expiry} (${p.daysLeft})</td><td>${fmtN(p.ask)} <small>(${p.spreadPct.toFixed(1)}٪)</small></td><td>${fmtN(p.theo)}</td><td>${fmtIv(p.iv)}</td><td>${p.delta.toFixed(2)}</td><td>${p.leverage.toFixed(1)}x</td><td>${p.oi}</td><td>${pct(p.bePct)}</td><td>${pct(p.profitPct)}</td><td>${pct(p.lossPct)}</td><td>${pct(p.flatPct)}</td><td><b>${p.rr.toFixed(2)}</b></td></tr>`).join('') : `<tr class="empty-row"><td colspan="15">قراردادی نیست — ${Object.entries(r.rejected).map(([k,v])=>`${k}: ${v}`).join('، ')}</td></tr>`;
+        openModal(`پیشنهاد آپشن ${it.symbol}`, head + `<div class="table-responsive"><table class="data-table"><thead><tr><th>#</th><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>خرید</th><th>منصفانه</th><th>IV</th><th>دلتا</th><th>اهرم</th><th>OI</th><th>سربه‌سر</th><th>هدف</th><th>حد ضرر</th><th>بی‌حرکت</th><th>RR</th></tr></thead><tbody>${picks}</tbody></table></div><div class="hint">بررسی‌شده ${r.considered} · قابل قبول ${r.passed}</div>`);
+    } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
+}
+async function loadOptionPositions() {
+    try {
+        const r = await apiFetch(`${BACKEND_URL}/api/options/positions`), s = r.stats;
+        document.getElementById('optStats').innerHTML = (s.open + s.closed) ? `<div class="stat"><small>باز / بسته</small><b>${s.open} / ${s.closed}</b></div><div class="stat"><small>وین‌ریت</small><b>${s.winRate.toFixed(0)}٪</b></div><div class="stat"><small>بازده کل</small><b>${pct(s.totalPnl)}</b></div><div class="stat"><small>میانگین</small><b>${pct(s.avgPnl)}</b></div><div class="stat"><small>سود/زیان</small><b>${pct(s.avgWin)} / ${pct(s.avgLoss)}</b></div><div class="stat"><small>Profit Factor</small><b>${s.profitFactor===Infinity?'∞':s.profitFactor.toFixed(2)}</b></div>` : '<div class="empty-note">موقعیتی ثبت نشده است</div>';
+        const tb = document.getElementById('optBody');
+        if (!r.positions.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="12">موقعیتی ثبت نشده است</td></tr>';
+        tb.innerHTML = r.positions.map(p => { const cur = p.status==='closed' ? p.exitBid : p.lastBid, curS = p.status==='closed' ? p.exitS : p.lastS, pnl = p.status==='closed' ? p.pnlPct : p.lastPnlPct; return `<tr>
+            <td>${esc(p.underlying)}</td><td>${esc(p.symbol)}</td><td>${fmtN(p.strike)}</td><td>${p.expiry}${p.lastDaysLeft!==undefined&&p.status==='open'?` <small>(${p.lastDaysLeft})</small>`:''}</td>
+            <td>${new Date(p.entryTime).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</td><td>${fmtN(p.entryAsk)}</td><td>${fmtN(cur)}${p.status==='open'?' <span class="badge long">باز</span>':''}</td><td>${pct(pnl)}</td>
+            <td>${fmtN(p.entryS)} → ${fmtN(curS)}</td><td>${fmtIv(p.entryIv)} → ${fmtIv(p.lastIv)}</td><td style="font-size:11px;">${esc(p.exitReason||'-')}</td>
+            <td><button class="btn tiny danger" onclick="deleteOptionPosition('${p._id}')">×</button></td></tr>`; }).join('');
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function deleteOptionPosition(id) { if (!confirm('حذف شود؟')) return; try { await apiFetch(`${BACKEND_URL}/api/options/positions/${id}`, { method:'DELETE' }); await loadOptionPositions(); } catch (e) { showAlert('خطا: ' + e.message); } }
+
+async function openLogs(source='memory') {
+    openModal('لاگ سیستم', '<div style="text-align:center;padding:30px;">در حال دریافت...</div>');
+    try {
+        let rows;
+        if (source === 'client') rows = clientLogs.slice().reverse();
+        else { const r = await apiFetch(`${BACKEND_URL}/api/logs?source=${source}&limit=300`); rows = r.logs; }
+        const tab = (k, l) => `<button class="btn small ${source===k?'':'outline'}" onclick="openLogs('${k}')">${l}</button>`;
+        const tabs = `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">${tab('memory','سرور')}${tab('db','خطاهای ذخیره‌شده')}${tab('client','مرورگر')}</div>`;
+        const body = rows.length ? rows.map(l => `<div style="font-family:monospace;font-size:11.5px;direction:ltr;text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);white-space:pre-wrap;word-break:break-all;color:${l.level==='error'?'var(--bad)':l.level==='warn'?'var(--warn)':'var(--text-dim)'}">${new Date(l.at).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${l.level}] ${esc(l.msg)}</div>`).join('') : '<div class="empty-note">لاگی نیست</div>';
+        openModal(`لاگ (${rows.length})`, tabs + body);
+    } catch (e) { openModal('لاگ', `<div class="empty-note">${esc(e.message)}</div>`); }
+}
+
+window.addEventListener('load', async () => {
+    if (!await waitForBackend()) { document.getElementById('bootMessage').textContent = 'اتصال برقرار نشد.'; document.getElementById('bootRetryBtn').style.display = 'inline-block'; return; }
+    if (!await loadStrategiesLibrary()) { document.getElementById('bootMessage').textContent = 'بارگذاری استراتژی‌ها ناموفق.'; document.getElementById('bootRetryBtn').style.display = 'inline-block'; return; }
+    document.getElementById('bootOverlay').style.display = 'none';
+    await checkBackendStatus(); await loadTimeframes(); await loadStrategies(); await loadMonitoredSymbols(); await loadConfigs(); await loadSignalHistory();
+    await loadOptionPositions();
+    setInterval(checkBackendStatus, 60000); setInterval(loadConfigs, 60000); setInterval(loadMonitoredSymbols, 120000);
+    setInterval(loadSignalHistory, 60000); setInterval(loadOptionPositions, 60000);
+    setInterval(() => { if (selectedConfigId) viewChart(selectedConfigId); }, 60000);
+});
+window.addEventListener('resize', () => { const pc = document.getElementById('priceChart'), rc = document.getElementById('panelChart'); priceChart && pc && priceChart.applyOptions({ width: pc.clientWidth }); panelChart && rc && panelChart.applyOptions({ width: rc.clientWidth }); });
+</script>
+</body>
+</html>
