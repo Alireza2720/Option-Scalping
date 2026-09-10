@@ -17,7 +17,7 @@ const STARTED_AT = new Date();
 const app = express();
 app.disable('x-powered-by');
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = 'v5.0-closed-htf-secure';
+const SERVER_VERSION = 'v5.1-quotes-confluence';
 let holidayDate = null, inactiveTicks = 0;
 
 // ---------------- تنظیمات ----------------
@@ -139,6 +139,15 @@ function getUnderlyingNames(symbol) {
     return Array.from(names);
 }
 
+// ---------------- آخرین قیمت‌ها (in-memory) ----------------
+const lastQuotes = new Map(); // symbol -> { price, queue, at }
+
+app.get('/api/quotes', (req, res) => {
+    const out = {};
+    for (const [sym, q] of lastQuotes) out[sym] = { price: q.price, queue: q.queue, at: q.at };
+    res.json(out);
+});
+
 // ---------------- تلگرام با صف ارسال ----------------
 async function telegramSend(text) {
     if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) throw new Error('تلگرام تنظیم نشده است');
@@ -259,7 +268,6 @@ async function getCandles(symbol, tf) {
     const permanent = await getDB().collection('candles_tf').find({ symbol, tf }).sort({ time: 1 }).toArray();
     return buildTfCandles(permanent, await getBaseCandles(symbol), TF[tf]);
 }
-// آرشیو حذف شده؛ این تابع صرفاً به getCandles نگاشت می‌شود
 async function getCandlesFull(symbol, tf) { return getCandles(symbol, tf); }
 async function activeConfigTimeframes() {
     const configs = await getDB().collection('strategy_configs').find({}).toArray();
@@ -510,17 +518,32 @@ async function evaluateStrategyConfig(config, marketInfo) {
     const inWindow = nowMin >= ENTRY_START && nowMin <= ENTRY_END;
     const queueTag = info && info.queue === 'buy' ? '\n⚠️ صف خرید — آپشن احتمالاً گران شده' : info && info.queue === 'sell' ? '\n⚠️ صف فروش' : '';
     const windowTag = last.signalType === 'BUY' && !inWindow ? `\n⏸ خارج از بازه‌ی ورود (${fmtMin(ENTRY_START)}–${fmtMin(ENTRY_END)}) — توصیه: ورود نکن` : '';
+
+    // ---- Confluence: شمارش استراتژی‌های هم‌جهت روی همین نماد ----
+    let confluence = 1;
+    if (last.signalType === 'BUY') {
+        try {
+            const otherConfigs = await db.collection('strategy_configs').find({
+                symbol: config.symbol, _id: { $ne: config._id }, enabled: true
+            }).toArray();
+            for (const oc of otherConfigs) {
+                const ost = await stateColl.findOne({ configId: oc._id.toString() });
+                if (ost && ost.position === 'LONG' && ost.lastCandleTime === last.time) confluence++;
+            }
+        } catch (e) { /* بی‌اهمیت */ }
+    }
+    const confluenceTag = confluence > 1 ? `\n🔥 هم‌گرایی ${confluence} استراتژی روی این نماد` : '';
+
     const title = (last.signalType === 'BUY' ? '📈 سیگنال خرید (کال)' : '🔔 خروج از خرید (بستن کال)') + (late ? ' ⏰ (با تأخیر — کندل قبلاً بسته شده)' : '');
-    const text = `${title}\n${label}\nروند ${htfTf}: ${result.htfTrend || '-'}\nقیمت بسته‌شدن: ${lastPrice.toLocaleString()}${info ? ` | لحظه‌ای: ${info.price.toLocaleString()}` : ''}\nدلیل: ${last.reason || '-'}${queueTag}${windowTag}${incompleteTag}`;
+    const text = `${title}\n${label}\nروند ${htfTf}: ${result.htfTrend || '-'}\nقیمت بسته‌شدن: ${lastPrice.toLocaleString()}${info ? ` | لحظه‌ای: ${info.price.toLocaleString()}` : ''}\nدلیل: ${last.reason || '-'}${confluenceTag}${queueTag}${windowTag}${incompleteTag}`;
     await notify(text);
     await stateColl.updateOne({ configId }, { $set: { lastNotifiedTime: last.time, lastNotifiedType: last.signalType } });
-    await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, incomplete: !!(lastHa && lastHa.complete === false), createdAt: new Date() });
+    await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, incomplete: !!(lastHa && lastHa.complete === false), confluence, createdAt: new Date() });
     await bumpDayStat('signals');
 
-    // توجه: دیگر trade سهم پایه ثبت نمی‌شود؛ فقط option_positions ثبت می‌شود
     if (last.signalType === 'BUY') {
         if (inWindow && !(info && info.queue === 'buy')) {
-            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId: null }); }
+            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId: null, confluence }); }
             catch (e) { console.error('❌ انتخاب آپشن:', e.message); await notify(`⚠️ انتخاب قرارداد آپشن برای ${config.symbol} ناموفق: ${e.message}`); }
         } else await notify(`ℹ️ ${config.symbol}: به‌دلیل ${!inWindow ? 'خارج از بازه‌ی ورود' : 'صف خرید'} قرارداد آپشن پیشنهاد نشد.`);
     }
@@ -547,7 +570,8 @@ async function tick() {
 
         const active = raw.filter(s => +s.tno > 0).length;
         if (minuteOfDay(tehran) >= SESSION_START + 10) {
-            if (active < 20) { if (++inactiveTicks >= 5) { await markHoliday(tehran); return; } } else inactiveTicks = 0;
+            // آستانه از ۵ به ۱۲ افزایش یافت تا false-positive کمتر شود
+            if (active < 20) { if (++inactiveTicks >= 12) { await markHoliday(tehran); return; } } else inactiveTicks = 0;
         }
         const rawMap = new Map(); raw.forEach(s => { if (s.l18) rawMap.set(s.l18, s); });
         const marketInfo = new Map();
@@ -561,6 +585,8 @@ async function tick() {
             const volDelta = prev && tvol >= prev.tvol ? tvol - prev.tvol : 0;
             lastSnap.set(m.symbol, { tno, tvol });
             marketInfo.set(m.symbol, { price, queue: atUpper ? 'buy' : atLower ? 'sell' : null });
+            // ذخیره آخرین قیمت برای endpoint /api/quotes
+            lastQuotes.set(m.symbol, { price, queue: atUpper ? 'buy' : atLower ? 'sell' : null, at: new Date() });
             if (!traded && !atUpper && !atLower) continue;
             await upsertLiveCandle(m.symbol, bucket1, price, volDelta);
             await upsertDailyCandle(m.symbol, dayTime, s);

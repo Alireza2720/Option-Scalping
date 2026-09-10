@@ -1,3 +1,4 @@
+// ======================== option.js (کامل) ========================
 'use strict';
 const fetch = require('node-fetch');
 const Settings = require('./settings.js');
@@ -20,9 +21,19 @@ function reloadFromSettings() {
 }
 
 const DEFAULT_SETTINGS = {
-    minDays: 20, maxDays: 90, maxSpreadPct: 8, minOI: 100, minTrades: 1, minPremium: 300,
-    deltaMin: 0.35, deltaMax: 0.85, maxIvHv: 1.6, rewardRisk: 1.5, topN: 3,
-    optionStopPct: 40, take1Pct: 50, take2Pct: 100, closeDaysBefore: 7, snapshotTtlDays: 30
+    minDays: 20, maxDays: 90,
+    maxSpreadPct: 10,
+    minOI: 500,
+    minTrades: 5,
+    minPremium: 300,
+    deltaMin: 0.35, deltaMax: 0.85,
+    maxIvHv: 1.4,
+    rewardRisk: 2.0,
+    topN: 3,
+    optionStopPct: 30,
+    take1Pct: 50, take2Pct: 100,
+    closeDaysBefore: 7
+    // snapshotTtlDays حذف شد
 };
 let settingsCache = null;
 async function getSettings(force) {
@@ -43,8 +54,6 @@ const norm = s => String(s || '').replace(/ي/g, 'ی').replace(/ك/g, 'ک').repl
 const num = v => { const n = parseFloat(String(v ?? '').replace(/,/g, '')); return Number.isFinite(n) ? n : 0; };
 const first = s => num(String(s || '').split('/')[0]);
 
-// تبدیل درصد به اعشار: اگر عدد بزرگ‌تر از ۳ باشد، درصد است (مثل ۲۵ → ۰.۲۵)
-// اگر کوچک‌تر باشد، از قبل اعشار است (مثل ۰.۲۵)
 const asDecimal = v => {
     const n = num(v);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -62,8 +71,8 @@ function parseContract(r) {
         bid: first(r.b_price), bidVol: first(r.b_volume), ask: first(r.s_price), askVol: first(r.s_volume),
         volume: num(r.Tvolume), value: num(r.Tvalue), trades: num(r.Tcount), oi: num(r.op), oiChange: num(r.op_change),
         bsApi: num(r.black_sholes),
-        ivApi: asDecimal(r.imp),
-        hvApi: asDecimal(r.sigma),
+        ivApi: asDecimal(r.imp),      // imp = Implied Volatility
+        hvApi: asDecimal(r.sigma),    // sigma = Historical Volatility
         deltaApi: num(r.delta),
         gammaApi: num(r.gamma),
         thetaApi: num(r.theta),
@@ -121,12 +130,12 @@ function metrics(c, S, hv) {
     const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0;
     const spreadPct = mid > 0 ? (c.ask - c.bid) / mid * 100 : null;
 
-    // اولویت: HV ورودی، بعد HV از API، در نهایت 0.4
+    // HV: اول از ورودی، بعد از API (sigma)، در نهایت 0.4
     const vol = hv || c.hvApi || 0.4;
 
     const theo = bsCall(S, c.strike, T, RISK_FREE, vol);
 
-    // اولویت: IV از API، در غیر این صورت از قیمت بازار استخراج
+    // IV: اول از API (imp)، در غیر این صورت از قیمت بازار استخراج
     let iv = c.ivApi;
     if (!iv || iv <= 0) {
         iv = impliedVol(c.ask > 0 ? c.ask : c.last, S, c.strike, T, RISK_FREE);
@@ -144,7 +153,7 @@ function metrics(c, S, hv) {
         thetaApi: c.thetaApi || null,
         vega: theo.vega,
         vegaApi: c.vegaApi || null,
-        iv,
+        iv,                  // IV نهایی (اولویت: imp API → محاسبه)
         ivApi: c.ivApi || null,
         ivHv: iv ? iv / vol : null,
         leverage: c.ask > 0 ? theo.delta * S / c.ask : null,
@@ -171,6 +180,23 @@ function breakevenMove(S, K, T2, sig, cost, halfSpread) {
     for (let i = 0; i < 50; i++) { const m = (lo + hi) / 2; if (f(m) > 0) hi = m; else lo = m; }
     return ((lo + hi) / 2 / S - 1) * 100;
 }
+
+// ---------------- Position Sizing ----------------
+function calcPositionSize(pick, scenario, settings) {
+    // قدرت سیگنال: هرچه RR بالاتر، حجم بیشتر
+    const rrScore = Math.min(1, (pick.rr || 0) / 4);
+    // IV/HV: هرچه ارزان‌تر، حجم بیشتر
+    const ivScore = pick.ivHv ? Math.min(1, Math.max(0.3, 1.2 / pick.ivHv)) : 0.6;
+    // فاصله تا stop: هرچه نزدیک‌تر، حجم بیشتر
+    const stopDist = scenario.stop && scenario.entry ? Math.abs(scenario.entry - scenario.stop) / scenario.entry : 0.03;
+    const stopScore = Math.min(1, 0.03 / Math.max(stopDist, 0.005));
+    // امتیاز ترکیبی (بین ۰.۳ تا ۱)
+    const score = Math.max(0.3, Math.min(1, (rrScore * 0.4 + ivScore * 0.3 + stopScore * 0.3)));
+    // حجم پایه = ۱ قرارداد، حداکثر ۵ قرارداد
+    return Math.max(1, Math.round(score * 5));
+}
+
+// ---------------- انتخاب قرارداد (با position sizing) ----------------
 function selectCalls(chain, underlying, sc, s) {
     const names = Array.isArray(underlying) ? underlying : [underlying];
     const cands = chain.filter(c => c.isCall && names.includes(c.underlying));
@@ -188,10 +214,12 @@ function selectCalls(chain, underlying, sc, s) {
         const rr = pl < 0 ? pt / -pl : (pt > 0 ? 99 : 0);
         const liq = Math.pow(Math.min(1, c.oi / 1000), 0.25) * (1 - (m.spreadPct / s.maxSpreadPct) * 0.4);
         const ivPen = m.ivHv ? Math.max(0.6, Math.min(1, 1.3 / m.ivHv)) : 1;
-        scored.push({ symbol: c.symbol, fullName: c.fullName, strike: c.strike, expiry: c.expiry, daysLeft: c.daysLeft, ask: c.ask, bid: c.bid, oi: c.oi, volume: c.volume, size: c.size,
+        const pick = { symbol: c.symbol, fullName: c.fullName, strike: c.strike, expiry: c.expiry, daysLeft: c.daysLeft, ask: c.ask, bid: c.bid, oi: c.oi, volume: c.volume, size: c.size,
             spreadPct: m.spreadPct, theo: m.theo, iv: m.iv, hv: m.hv, ivHv: m.ivHv, delta: m.delta, thetaDay: m.thetaDay, leverage: m.leverage,
             profitPct: pt / cost * 100, lossPct: pl / cost * 100, flatPct: pf / cost * 100, rr,
-            bePct: breakevenMove(S, c.strike, T2, sig, cost, half), score: rr * liq * ivPen, S });
+            bePct: breakevenMove(S, c.strike, T2, sig, cost, half), score: rr * liq * ivPen, S };
+        pick.positionSize = calcPositionSize(pick, sc, s);
+        scored.push(pick);
     }
     scored.sort((a, b) => b.score - a.score);
     return { picks: scored.slice(0, s.topN), considered: cands.length, passed: scored.length, rejected };
@@ -215,25 +243,34 @@ function formatRecommendation(symbol, sc, res, title = '🎯 انتخاب قرا
         t += `\n${i + 1}) ${p.symbol} | اعمال ${f0(p.strike)} | ${p.expiry} (${p.daysLeft} روز)\n` +
             `   خرید ${f0(p.ask)} (اسپرد ${p.spreadPct.toFixed(1)}٪) | منصفانه ${f0(p.theo)} | IV ${p.iv ? (p.iv * 100).toFixed(0) + '٪' : '-'}${p.ivHv ? ` (${p.ivHv.toFixed(2)}×HV)` : ''}\n` +
             `   دلتا ${p.delta.toFixed(2)} | اهرم ${p.leverage.toFixed(1)}x | OI ${p.oi} | تتا/روز ${f0(p.thetaDay)} | سربه‌سر تا افق ${pc(p.bePct)}\n` +
-            `   هدف ${pc(p.profitPct)} | حد ضرر ${pc(p.lossPct)} | بی‌حرکت ${pc(p.flatPct)} | RR ${p.rr.toFixed(2)}`;
+            `   هدف ${pc(p.profitPct)} | حد ضرر ${pc(p.lossPct)} | بی‌حرکت ${pc(p.flatPct)} | RR ${p.rr.toFixed(2)} | حجم پیشنهادی ${p.positionSize} قرارداد`;
     });
     const rej = Object.entries(res.rejected); if (rej.length) t += `\n\n⛔ رد شده ${res.considered - res.passed}: ` + rej.map(([k, v]) => `${k} ${v}`).join('، ');
     return t;
 }
 
 // ---------------- رویدادهای سیگنال ----------------
-async function onBuySignal({ config, indicators, price, liveS, tradeId }) {
+async function onBuySignal({ config, indicators, price, liveS, tradeId, confluence = 1 }) {
     const s = await getSettings(), chain = await fetchChain(60000);
     const sc = await buildScenario(config, price, liveS, indicators, s);
     const names = deps.getUnderlyingNames ? deps.getUnderlyingNames(config.symbol) : [norm(config.symbol)];
     const res = selectCalls(chain, names, sc, s);
-    await deps.notify(formatRecommendation(config.symbol, sc, res));
+    await deps.notify(formatRecommendation(config.symbol, sc, res, confluence > 1 ? `🎯 انتخاب قرارداد کال (هم‌گرایی ${confluence} استراتژی)` : undefined));
     if (res.picks.length) {
         const p = res.picks[0];
-        await deps.getDB().collection('option_positions').insertOne({
-            configId: config._id.toString(), tradeId: tradeId ? tradeId.toString() : null, underlying: config.symbol, underlyingNames: names, symbol: p.symbol, fullName: p.fullName,
-            strike: p.strike, expiry: p.expiry, entryTime: new Date(), entryAsk: p.ask, entryBid: p.bid, entryS: p.S, entryIv: p.iv, entryDelta: p.delta,
-            entryDaysLeft: p.daysLeft, size: p.size, scenario: sc, paper: true, status: 'open'
+        const db = deps.getDB();
+        // Auto Roll: اگه پوزیشن باز قبلی روی همین configId هست، ببندش
+        const existing = await db.collection('option_positions').findOne({ configId: config._id.toString(), status: 'open' });
+        if (existing) {
+            await db.collection('option_positions').updateOne({ _id: existing._id }, { $set: { status: 'closed', exitTime: new Date(), exitReason: 'رول به قرارداد جدید' } });
+        }
+        await db.collection('option_positions').insertOne({
+            configId: config._id.toString(), tradeId: tradeId ? tradeId.toString() : null,
+            underlying: config.symbol, underlyingNames: names, symbol: p.symbol, fullName: p.fullName,
+            strike: p.strike, expiry: p.expiry, entryTime: new Date(), entryAsk: p.ask, entryBid: p.bid,
+            entryS: p.S, entryIv: p.iv, entryDelta: p.delta, entryDaysLeft: p.daysLeft,
+            size: p.size, positionSize: p.positionSize, scenario: sc, paper: true, status: 'open',
+            confluence, stagedExits: []  // برای staged profit taking
         });
     }
     return res;
@@ -245,7 +282,7 @@ async function recommendForState(config, state) {
     return { scenario: sc, ...selectCalls(chain, names, sc, s) };
 }
 
-// ---------------- مدیریت موقعیت‌های باز ----------------
+// ---------------- مدیریت موقعیت‌های باز (با staged exit) ----------------
 async function managePositions(chain) {
     const db = deps.getDB(), s = await getSettings();
     const open = await db.collection('option_positions').find({ status: 'open' }).toArray();
@@ -261,14 +298,34 @@ async function managePositions(chain) {
         const spreadPct = c.bid > 0 && c.ask > 0 ? (c.ask - c.bid) / ((c.ask + c.bid) / 2) * 100 : null;
         const upd = { lastBid: c.bid, lastAsk: c.ask, lastS: c.S, lastPnlPct: pnlPct, lastIv: iv, lastDaysLeft: c.daysLeft, lastCheck: new Date() };
         let reason = null;
+
+        // Time filter: ۳۰ دقیقه آخر بازار ورود/خروج جدید نکن (فقط هشدار)
+        const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+        const isLast30Min = nowMin >= 12 * 60; // ۱۲:۰۰ به بعد
+
+        // Staged Profit Taking
+        const staged = p.stagedExits || [];
+        const taken1 = staged.includes(1), taken2 = staged.includes(2);
+        if (!reason && pnlPct >= s.take1Pct && !taken1) {
+            upd.stagedExits = [...staged, 1];
+            await deps.notify(`💰 ${p.symbol} | سود ${pnlPct.toFixed(0)}٪ — فروش ۳۳٪ موقعیت (پله ۱)`);
+        }
+        if (!reason && pnlPct >= s.take2Pct && !taken2) {
+            upd.stagedExits = [...(upd.stagedExits || staged), 2];
+            await deps.notify(`💰 ${p.symbol} | سود ${pnlPct.toFixed(0)}٪ — فروش ۳۳٪ موقعیت (پله ۲)`);
+        }
+
         if (!longIds.has(p.configId)) reason = 'سیگنال خروج / لغو روی سهم پایه';
         else if (c.daysLeft <= s.closeDaysBefore) reason = `${c.daysLeft} روز تا سررسید`;
         else if (pnlPct <= -s.optionStopPct) reason = `حد ضرر آپشن (${pnlPct.toFixed(0)}٪)`;
-        else if (pnlPct >= s.take2Pct) reason = `حد سود کامل (${pnlPct.toFixed(0)}٪)`;
+        else if (pnlPct >= s.take2Pct && taken2) reason = `حد سود کامل (${pnlPct.toFixed(0)}٪)`;
+
         const warns = [];
         if (!reason && pnlPct >= s.take1Pct && !p.take1Notified) { warns.push(`💰 سود ${pnlPct.toFixed(0)}٪ — پیشنهاد: فروش نیمی از موقعیت`); upd.take1Notified = true; }
         if (!reason && p.entryIv && iv && iv < p.entryIv * 0.8 && !p.ivWarned) { warns.push(`📉 IV از ${(p.entryIv * 100).toFixed(0)}٪ به ${(iv * 100).toFixed(0)}٪ افت کرد`); upd.ivWarned = true; }
         if (!reason && spreadPct !== null && spreadPct > 15 && !p.spreadWarned) { warns.push(`⚠️ اسپرد ${spreadPct.toFixed(0)}٪ — نقدشوندگی افت کرد`); upd.spreadWarned = true; }
+        if (isLast30Min && !reason && !p.timeWarned) { warns.push(`⏰ در ۳۰ دقیقه آخر بازار هستیم — خروج یا ورود جدید توصیه نمی‌شود`); upd.timeWarned = true; }
+
         if (reason) {
             Object.assign(upd, { status: 'closed', exitTime: new Date(), exitBid: exitPx, exitS: c.S, pnlPct, exitReason: reason });
             let roll = '';
@@ -321,12 +378,15 @@ async function storageStats() {
 function positionStats(list) {
     const closed = list.filter(p => p.status === 'closed' && typeof p.pnlPct === 'number'), wins = closed.filter(p => p.pnlPct > 0);
     const sum = a => a.reduce((x, p) => x + p.pnlPct, 0), gp = sum(wins), gl = -sum(closed.filter(p => p.pnlPct <= 0));
-    return { open: list.length - closed.length, closed: closed.length, winRate: closed.length ? wins.length / closed.length * 100 : 0, avgPnl: closed.length ? sum(closed) / closed.length : 0,
-        totalPnl: sum(closed), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0), avgWin: wins.length ? gp / wins.length : 0, avgLoss: closed.length - wins.length ? -gl / (closed.length - wins.length) : 0 };
+    const pf = gl > 0 ? gp / gl : (gp > 0 ? null : 0); // null به‌جای Infinity
+    return { open: list.length - closed.length, closed: closed.length, winRate: closed.length ? wins.length / closed.length * 100 : 0,
+        avgPnl: closed.length ? sum(closed) / closed.length : 0, totalPnl: sum(closed),
+        profitFactor: pf, avgWin: wins.length ? gp / wins.length : 0,
+        avgLoss: closed.length - wins.length ? -gl / (closed.length - wins.length) : 0 };
 }
 
-// ---------------- بک‌تست تقریبی آپشن ----------------
-const OPT_BT_DEFAULTS = { assumedMaturityDays: 45, ivMultiplier: 1.2, spreadPct: 5 };
+// ---------------- بک‌تست تقریبی آپشن (با IV واقعی) ----------------
+const OPT_BT_DEFAULTS = { assumedMaturityDays: 45, ivMultiplier: 1.0, spreadPct: 5 };
 function historicalHV(closes, uptoIndex, n = 20) {
     const start = Math.max(0, uptoIndex - n), slice = closes.slice(start, uptoIndex + 1);
     if (slice.length < 6) return null;
@@ -342,7 +402,7 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     if (!daily.length) {
         return {
             assumptions: p,
-            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: 0 },
+            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: null },
             trades: [],
             diagnostic: `کندل روزانه برای ${symbol} وجود ندارد. ابتدا از دکمه‌ی «تاریخچه» در بخش نمادهای زیر نظر استفاده کنید.`
         };
@@ -350,7 +410,7 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     if (!closedTrades.length) {
         return {
             assumptions: p,
-            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: 0 },
+            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: null },
             trades: [],
             diagnostic: 'استراتژی سهم پایه هیچ معامله‌ی بسته‌شده‌ای تولید نکرده است. تنظیمات استراتژی را بررسی کنید یا داده‌ی بیشتری جمع کنید.'
         };
@@ -359,7 +419,9 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     const trades = [];
     for (const t of closedTrades) {
         let idx = -1; for (let i = 0; i < times.length; i++) { if (times[i] <= t.entryTime) idx = i; else break; }
-        const hv = (idx >= 0 ? historicalHV(closes, idx) : null) || 0.4, sigma = hv * p.ivMultiplier;
+        const hv = (idx >= 0 ? historicalHV(closes, idx) : null) || 0.4;
+        // استفاده از IV واقعی اگر موجود باشد، در غیر این صورت hv * multiplier
+        const sigma = t.entryIv && t.entryIv > 0 ? t.entryIv : hv * p.ivMultiplier;
         const daysHeld = Math.max((t.exitTime - t.entryTime) / 86400, 0.1);
         const Tentry = p.assumedMaturityDays / 365, Texit = Math.max(p.assumedMaturityDays - daysHeld, 0.5) / 365;
         const strike = Math.round(t.entryPrice);
@@ -367,13 +429,15 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
         const halfSpread = p.spreadPct / 200;
         const entryCost = entryTheo.price * (1 + halfSpread) * (1 + FEE_BUY), exitProceeds = exitTheo.price * (1 - halfSpread) * (1 - FEE_SELL);
         if (!(entryCost > 0)) continue;
-        trades.push({ entryTime: t.entryTime, exitTime: t.exitTime, stockEntry: t.entryPrice, stockExit: t.exitPrice, strike, hv, entryDelta: entryTheo.delta,
-            optionEntry: entryTheo.price, optionExit: exitTheo.price, pnlPct: (exitProceeds / entryCost - 1) * 100, exitReason: t.exitReason });
+        trades.push({ entryTime: t.entryTime, exitTime: t.exitTime, stockEntry: t.entryPrice, stockExit: t.exitPrice, strike, hv, entryIv: t.entryIv, sigma,
+            entryDelta: entryTheo.delta, optionEntry: entryTheo.price, optionExit: exitTheo.price,
+            pnlPct: (exitProceeds / entryCost - 1) * 100, exitReason: t.exitReason });
     }
     const wins = trades.filter(x => x.pnlPct > 0), sum = a => a.reduce((s, x) => s + x.pnlPct, 0);
     const gp = sum(wins), gl = -sum(trades.filter(x => x.pnlPct <= 0));
-    const result = { assumptions: p, stats: { count: trades.length, winRate: trades.length ? wins.length / trades.length * 100 : 0, avgPnl: trades.length ? sum(trades) / trades.length : 0,
-        totalPnl: sum(trades), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0) }, trades };
+    const pf = gl > 0 ? gp / gl : (gp > 0 ? null : 0);
+    const result = { assumptions: p, stats: { count: trades.length, winRate: trades.length ? wins.length / trades.length * 100 : 0,
+        avgPnl: trades.length ? sum(trades) / trades.length : 0, totalPnl: sum(trades), profitFactor: pf }, trades };
     if (!trades.length) result.diagnostic = 'هیچ معامله‌ای در بک‌تست تولید نشد (احتمالاً قیمت‌های ورود و خروج یکسان بوده یا داده‌ی کافی نیست).';
     return result;
 }

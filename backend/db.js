@@ -33,10 +33,10 @@ async function ensureIndexes(database) {
 async function cleanupLegacy(database) {
     try {
         await database.collection('meta').deleteMany({ _id: { $in: ['candlestick_usage', 'allsymbols_usage'] } });
-        for (const name of ['seed_log', 'candles_tf']) {
-            const cols = await database.listCollections({ name }).toArray();
-            if (cols.length) await database.collection(name).drop();
-        }
+    for (const name of ['seed_log']) {
+      const cols = await database.listCollections({ name }).toArray();
+      if (cols.length) await database.collection(name).drop();
+    }
     } catch (e) { /* بی‌اهمیت */ }
 }
 
