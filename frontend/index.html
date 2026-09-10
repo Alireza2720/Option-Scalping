@@ -305,24 +305,33 @@ const TF_LABELS = { '1m':'۱ دقیقه','3m':'۳ دقیقه','5m':'۵ دقیق�
 const TF_MIN = { '1m':1,'3m':3,'5m':5,'10m':10,'15m':15,'30m':30,'1h':60,'1d':1440 };
 const SIGNAL_LABELS = { BUY:'خرید کال', EXIT_LONG:'خروج از کال' };
 const PARAM_LABELS = {
+    // RSI
     rsiFastPeriod:'دوره RSI سریع', rsiSlowPeriod:'دوره RSI کند', rsiOversold:'آستانه اشباع فروش RSI', rsiOverbought:'آستانه اشباع خرید RSI',
+    // عمومی
     lookback:'تعداد کندل نگاه به عقب', maxHoldBars:'حداکثر کندل نگه‌داری', cooldownBars:'کندل استراحت پس از خروج',
+    // EMA
     emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', pullbackPct:'حداکثر فاصله از EMA سریع (٪)', exitBufferPct:'بافر خروج (٪)',
+    // MACD
     macdFast:'دوره MACD سریع', macdSlow:'دوره MACD کند', macdSignal:'دوره Signal',
+    // Ichimoku
     tenkanPeriod:'دوره Tenkan-sen', kijunPeriod:'دوره Kijun-sen', senkouBPeriod:'دوره Senkou Span B',
+    // مشترک
     htfEma:'EMA تایم‌فریم بالا', htfRsiPeriod:'RSI تایم‌فریم بالا', atrPeriod:'دوره ATR', atrMult:'ضریب ATR', requireNoLowerWick:'کندل HA بدون سایه پایین (1/0)',
-    // ===== SMC Unicorn =====
-    swingLength:'طول پنجره سوئینگ (کندل)',
-    fvgMinGapPct:'حداقل شکاف FVG (٪)',
-    useOTE:'استفاده از فیلتر OTE (1/0)',
-    oteLow:'سطح پایین OTE (مثلاً 0.618)',
-    oteHigh:'سطح بالای OTE (مثلاً 0.786)',
-    useBreakEven:'انتقال SL به نقطه ورود بعد از TP1 (1/0)',
-    tp1R:'هدف اول (نسبت R)',
-    tp2R:'هدف دوم (نسبت R)',
-    tp3R:'هدف سوم (نسبت R)',
-    minLiquiditySweepPct:'حداقل عمق شکار نقدینگی (٪)',
-    requireVolumeFilter:'فیلتر حجم (1/0) — فعلاً غیرفعال'
+    // SMC Unicorn
+    swingLength:'طول پنجره سوئینگ (کندل)', fvgMinGapPct:'حداقل شکاف FVG (٪)',
+    useOTE:'استفاده از فیلتر OTE (1/0)', oteLow:'سطح پایین OTE (مثلاً 0.618)', oteHigh:'سطح بالای OTE (مثلاً 0.786)',
+    useBreakEven:'انتقال SL به نقطه ورود بعد از TP1 (1/0)', tp1R:'هدف اول (نسبت R)', tp2R:'هدف دوم (نسبت R)', tp3R:'هدف سوم (نسبت R)',
+    minLiquiditySweepPct:'حداقل عمق شکار نقدینگی (٪)', requireVolumeFilter:'فیلتر حجم (1/0)',
+    useKillzone:'فعال‌سازی Killzone (1/0)', killzone1Start:'شروع Killzone ۱ (ساعت)', killzone1End:'پایان Killzone ۱ (ساعت)',
+    killzone2Start:'شروع Killzone ۲ (ساعت)', killzone2End:'پایان Killzone ۲ (ساعت)', minConfluence:'حداقل تعداد شرط (۲ یا ۳)',
+    // Silver Bullet
+    sb1Start:'شروع پنجره ۱ (ساعت)', sb1End:'پایان پنجره ۱ (ساعت)',
+    sb2Start:'شروع پنجره ۲ (ساعت)', sb2End:'پایان پنجره ۲ (ساعت)',
+    sb3Start:'شروع پنجره ۳ (ساعت)', sb3End:'پایان پنجره ۳ (ساعت)',
+    useSessionEndExit:'خروج در پایان پنجره (1/0)',
+    requireDisplacement:'نیاز به Displacement (1/0)', displacementMult:'ضریب Displacement',
+    // OB + Sweep
+    obLookback:'تعداد کندل جستجوی Order Block', minSweepPct:'حداقل عمق شکار نقدینگی (٪)'
 };
 const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر',
     macd:'MACD', signal:'Signal', hist:'هیستوگرام', tenkan:'Tenkan', kijun:'Kijun', spanA:'Span A', spanB:'Span B' };

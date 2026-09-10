@@ -526,8 +526,11 @@ async function evaluateStrategyConfig(config, marketInfo) {
             const otherConfigs = await db.collection('strategy_configs').find({
                 symbol: config.symbol, _id: { $ne: config._id }, enabled: true
             }).toArray();
+            const otherIds = otherConfigs.map(oc => oc._id.toString());
+            const otherStates = await stateColl.find({ configId: { $in: otherIds } }).toArray();
+            const stateMap = new Map(otherStates.map(s => [s.configId, s]));
             for (const oc of otherConfigs) {
-                const ost = await stateColl.findOne({ configId: oc._id.toString() });
+                const ost = stateMap.get(oc._id.toString());
                 if (ost && ost.position === 'LONG' && ost.lastCandleTime === last.time) confluence++;
             }
         } catch (e) { /* بی‌اهمیت */ }
