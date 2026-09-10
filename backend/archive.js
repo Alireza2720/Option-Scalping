@@ -79,8 +79,13 @@ async function allArchiveStats() {
     if (!URIS.length) return [];
     const out = [];
     for (const uri of URIS) {
-        try { const { db } = await connectOne(uri); const mb = await dbSizeMB(db); out.push({ uri: uri.slice(0, 25) + '...', mb: mb === null ? null : +mb.toFixed(1) }); }
-        catch (e) { out.push({ uri: uri.slice(0, 25) + '...', error: e.message }); }
+        try {
+            const { db } = await connectOne(uri);
+            const mb = await dbSizeMB(db);
+            out.push({ index: out.length + 1, mb: mb === null ? null : +mb.toFixed(1) });
+        } catch (e) {
+            out.push({ index: out.length + 1, error: 'اتصال ناموفق' });
+        }
     }
     return out;
 }

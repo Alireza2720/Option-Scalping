@@ -51,7 +51,6 @@
     }
     function calculateSimpleCandles(data) { return data.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, bullish: c.close > c.open, complete: c.complete !== false })); }
     function getDisplayCandles(data, candleType) { return candleType === 'simple' ? calculateSimpleCandles(data) : calculateHeikinAshi(data); }
-    // کندل HA «قوی»: بدون سایه‌ی پایین (با تلورانس ۰.۱٪)
     function noLowerWick(h) { return h.low >= Math.min(h.open, h.close) * 0.999; }
 
     // ---------------- اندیکاتورها ----------------
@@ -84,6 +83,60 @@
         return atr;
     }
 
+    // ====== اندیکاتور جدید: MACD ======
+    function calculateMACD(closes, fast, slow, signal) {
+        const emaFast = calculateEMA(closes, fast);
+        const emaSlow = calculateEMA(closes, slow);
+        const macdLine = new Array(closes.length).fill(null);
+        for (let i = 0; i < closes.length; i++) {
+            if (emaFast[i] !== null && emaSlow[i] !== null) macdLine[i] = emaFast[i] - emaSlow[i];
+        }
+        // Signal line = EMA of MACD line (فقط مقادیر غیر null)
+        const validMacd = [];
+        const validIdx = [];
+        for (let i = 0; i < macdLine.length; i++) {
+            if (macdLine[i] !== null) { validMacd.push(macdLine[i]); validIdx.push(i); }
+        }
+        const signalEma = calculateEMA(validMacd, signal);
+        const signalLine = new Array(closes.length).fill(null);
+        for (let j = 0; j < validIdx.length; j++) {
+            if (signalEma[j] !== null) signalLine[validIdx[j]] = signalEma[j];
+        }
+        const histogram = new Array(closes.length).fill(null);
+        for (let i = 0; i < closes.length; i++) {
+            if (macdLine[i] !== null && signalLine[i] !== null) histogram[i] = macdLine[i] - signalLine[i];
+        }
+        return { macdLine, signalLine, histogram };
+    }
+
+    // ====== اندیکاتور جدید: Ichimoku ======
+    function calculateIchimoku(candles, tenkanP, kijunP, senkouBP) {
+        const n = candles.length;
+        const tenkan = new Array(n).fill(null);
+        const kijun = new Array(n).fill(null);
+        const spanA = new Array(n).fill(null);
+        const spanB = new Array(n).fill(null);
+
+        function highestHigh(arr, from, to) {
+            let h = -Infinity;
+            for (let i = from; i <= to && i < arr.length; i++) h = Math.max(h, arr[i].high);
+            return h;
+        }
+        function lowestLow(arr, from, to) {
+            let l = Infinity;
+            for (let i = from; i <= to && i < arr.length; i++) l = Math.min(l, arr[i].low);
+            return l;
+        }
+
+        for (let i = 0; i < n; i++) {
+            if (i >= tenkanP - 1) tenkan[i] = (highestHigh(candles, i - tenkanP + 1, i) + lowestLow(candles, i - tenkanP + 1, i)) / 2;
+            if (i >= kijunP - 1) kijun[i] = (highestHigh(candles, i - kijunP + 1, i) + lowestLow(candles, i - kijunP + 1, i)) / 2;
+            if (i >= senkouBP - 1) spanB[i] = (highestHigh(candles, i - senkouBP + 1, i) + lowestLow(candles, i - senkouBP + 1, i)) / 2;
+            if (tenkan[i] !== null && kijun[i] !== null) spanA[i] = (tenkan[i] + kijun[i]) / 2;
+        }
+        return { tenkan, kijun, spanA, spanB };
+    }
+
     // ---------------- تایم‌فریم بالا (فیلتر روند، بدون نگاه به آینده) ----------------
     function htfCloseTime(c, htfMin) {
         const t = getTehranParts(new Date(c.time * 1000));
@@ -106,7 +159,7 @@
         });
         let p = 0;
         return {
-            forTime(t) { // آخرین کندل HTF که قبل از این کندل بسته شده است
+            forTime(t) {
                 while (p + 1 < rows.length && rows[p + 1].closeTime <= t) p++;
                 return rows[p] && rows[p].closeTime <= t ? rows[p] : null;
             }
@@ -114,7 +167,7 @@
     }
     function inEntryWindow(timeSec, w) {
         if (!w) return true;
-        const m = minuteOfDay(timeSec); if (m === 0) return true; // کندل روزانه
+        const m = minuteOfDay(timeSec); if (m === 0) return true;
         return m >= w.start && m <= w.end;
     }
     const round = v => (v === null || v === undefined) ? null : Math.round(v * 100) / 100;
@@ -158,7 +211,7 @@
                 else if (trend === 'صعودی' && rsiSlow[i] > 50 && inEntryWindow(c.time, ctx && ctx.entryWindow)) {
                     let dipped = false;
                     for (let k = Math.max(0, i - p.lookback); k < i; k++) if (rsiFast[k] !== null && rsiFast[k] <= p.rsiOversold) dipped = true;
-                    const flip = h.bullish && ((hp && !hp.bullish) || (rsiFast[i - 1] !== null && rsiFast[i - 1] <= p.rsiOversold)); // تغییر وضعیت، نه وضعیت
+                    const flip = h.bullish && ((hp && !hp.bullish) || (rsiFast[i - 1] !== null && rsiFast[i - 1] <= p.rsiOversold));
                     const strong = !p.requireNoLowerWick || noLowerWick(h);
                     if (dipped && flip && strong && rsiFast[i] > p.rsiOversold) {
                         position = 'LONG'; signalType = 'BUY';
@@ -197,7 +250,7 @@
             if (eF[i] === null || eM[i] === null || eS[i] === null || atr[i] === null || i === 0 || eS[i - 1] === null) { signals.push({ time: c.time, indicators: ind, signalType: null, position, reason: null }); continue; }
 
             if (position === 'LONG') {
-                entry.stop = Math.max(entry.stop, c.close - p.atrMult * atr[i]); // حد ضرر تریلینگ
+                entry.stop = Math.max(entry.stop, c.close - p.atrMult * atr[i]);
                 ind.stop = round(entry.stop);
                 const bars = i - entry.idx;
                 if (c.close < entry.stop) reason = `شکست حد ضرر تریلینگ (${Math.round(entry.stop).toLocaleString()})`;
@@ -234,6 +287,140 @@
         return { ha, signals, trades, htfTrend: lastTrend };
     }
 
+    // ==========================================================
+    // استراتژی ۳: مومنتوم MACD — فقط کال
+    // منطق: کراس صعودی MACD بالای خط صفر + کندل HA صعودی + روند HTF صعودی
+    // خروج: کراس نزولی MACD یا دو کندل پیاپی کوچک‌شونده هیستوگرام یا HTF نزولی
+    // ==========================================================
+    const MACD_DEFAULTS = { macdFast: 12, macdSlow: 26, macdSignal: 9, atrPeriod: 14, atrMult: 2, maxHoldBars: 15, cooldownBars: 2, requireNoLowerWick: 0, htfEma: 20, htfRsiPeriod: 14 };
+
+    function runMACDMomentum(candles, params, ctx) {
+        const p = { ...MACD_DEFAULTS, ...(params || {}) };
+        const ha = getDisplayCandles(candles, p.candleType || 'heikin');
+        const closes = candles.map(c => c.close);
+        const atr = calculateATR(candles, p.atrPeriod);
+        const { macdLine, signalLine, histogram } = calculateMACD(closes, p.macdFast, p.macdSlow, p.macdSignal);
+        const htf = buildHtf(ctx, p), htfName = (ctx && ctx.htfTimeframe) || '1d';
+        const signals = [], trades = [];
+        let position = null, entry = null, cooldown = 0, lastTrend = null;
+
+        for (let i = 0; i < candles.length; i++) {
+            const c = candles[i], h = ha[i], hp = ha[i - 1];
+            const row = htf.forTime(c.time), trend = row ? row.trend : null; if (trend) lastTrend = trend;
+            const ind = { macd: round(macdLine[i]), signal: round(signalLine[i]), hist: round(histogram[i]), atr: round(atr[i]), stop: entry ? round(entry.stop) : null };
+            let signalType = null, reason = null;
+
+            // نیاز به حداقل کندل برای محاسبه MACD
+            if (macdLine[i] === null || signalLine[i] === null || histogram[i] === null || atr[i] === null || i < 1 || macdLine[i - 1] === null || signalLine[i - 1] === null) {
+                signals.push({ time: c.time, indicators: ind, signalType: null, position, reason: null }); continue;
+            }
+
+            if (position === 'LONG') {
+                const bars = i - entry.idx;
+                const deathCross = macdLine[i] < signalLine[i] && macdLine[i - 1] >= signalLine[i - 1];
+                const histShrinking = histogram[i] !== null && histogram[i - 1] !== null && histogram[i - 2] !== null &&
+                    histogram[i] > 0 && histogram[i] < histogram[i - 1] && histogram[i - 1] < histogram[i - 2];
+
+                if (deathCross) reason = 'کراس نزولی MACD (Death Cross)';
+                else if (histShrinking) reason = 'هیستوگرام MACD دو کندل پیاپی کوچک‌شونده';
+                else if (c.close < entry.stop) reason = `شکست حد ضرر ATR (${Math.round(entry.stop).toLocaleString()})`;
+                else if (trend === 'نزولی') reason = `روند ${htfName} نزولی شد`;
+                else if (bars >= p.maxHoldBars) reason = `سقف زمانی ${p.maxHoldBars} کندل`;
+                if (reason) {
+                    position = null; signalType = 'EXIT_LONG';
+                    const tr = trades[trades.length - 1]; if (tr) { tr.exitDate = c.time; tr.exitPrice = c.close; tr.pnlPct = (c.close / tr.entryPrice - 1) * 100; tr.exitReason = reason; }
+                    entry = null; cooldown = p.cooldownBars;
+                }
+            } else {
+                if (cooldown > 0) cooldown--;
+                else if (trend === 'صعودی' && inEntryWindow(c.time, ctx && ctx.entryWindow)) {
+                    const goldenCross = macdLine[i] > signalLine[i] && macdLine[i - 1] <= signalLine[i - 1];
+                    const aboveZero = macdLine[i] > 0;
+                    const flip = h.bullish && hp && !hp.bullish;
+                    const strong = !p.requireNoLowerWick || noLowerWick(h);
+                    if (goldenCross && aboveZero && flip && strong) {
+                        position = 'LONG'; signalType = 'BUY';
+                        entry = { idx: i, price: c.close, stop: c.close - p.atrMult * atr[i] };
+                        ind.stop = round(entry.stop);
+                        reason = `کراس صعودی MACD بالای صفر + کندل HA صعودی + روند ${htfName} صعودی`;
+                        trades.push({ type: 'خرید', entryDate: c.time, entryPrice: c.close, stop: entry.stop, reason });
+                    }
+                }
+            }
+            signals.push({ time: c.time, indicators: ind, signalType, position, reason });
+        }
+        return { ha, signals, trades, htfTrend: lastTrend };
+    }
+
+    // ==========================================================
+    // استراتژی ۴: ابر ایچیموکو (Ichimoku Cloud) — فقط کال
+    // منطق: قیمت بالای ابر + ابر سبز + کراس صعودی Tenkan/Kijun + کندل HA صعودی
+    // خروج: قیمت زیر ابر برود یا کراس نزولی TK یا سقف زمانی
+    // ==========================================================
+    const ICHIMOKU_DEFAULTS = { tenkanPeriod: 9, kijunPeriod: 26, senkouBPeriod: 52, maxHoldBars: 20, cooldownBars: 3, atrPeriod: 14, atrMult: 2.5, requireNoLowerWick: 1, htfEma: 20, htfRsiPeriod: 14 };
+
+    function runIchimoku(candles, params, ctx) {
+        const p = { ...ICHIMOKU_DEFAULTS, ...(params || {}) };
+        const ha = getDisplayCandles(candles, p.candleType || 'heikin');
+        const atr = calculateATR(candles, p.atrPeriod);
+        const { tenkan, kijun, spanA, spanB } = calculateIchimoku(candles, p.tenkanPeriod, p.kijunPeriod, p.senkouBPeriod);
+        const htf = buildHtf(ctx, p), htfName = (ctx && ctx.htfTimeframe) || '1d';
+        const signals = [], trades = [];
+        let position = null, entry = null, cooldown = 0, lastTrend = null;
+        const minBars = p.senkouBPeriod + 2;
+
+        for (let i = 0; i < candles.length; i++) {
+            const c = candles[i], h = ha[i], hp = ha[i - 1];
+            const row = htf.forTime(c.time), trend = row ? row.trend : null; if (trend) lastTrend = trend;
+            const ind = { tenkan: round(tenkan[i]), kijun: round(kijun[i]), spanA: round(spanA[i]), spanB: round(spanB[i]), atr: round(atr[i]), stop: entry ? round(entry.stop) : null };
+            let signalType = null, reason = null;
+
+            if (i < minBars || atr[i] === null || tenkan[i] === null || kijun[i] === null || spanA[i] === null || spanB[i] === null) {
+                signals.push({ time: c.time, indicators: ind, signalType: null, position, reason: null }); continue;
+            }
+
+            const cloudTop = Math.max(spanA[i], spanB[i]);
+            const cloudBottom = Math.min(spanA[i], spanB[i]);
+            const aboveCloud = c.close > cloudTop;
+            const belowCloud = c.close < cloudBottom;
+            const greenCloud = spanA[i] > spanB[i];
+            const tkBullish = tenkan[i] > kijun[i];
+            const tkBearish = tenkan[i] < kijun[i];
+
+            if (position === 'LONG') {
+                const bars = i - entry.idx;
+                const tkCrossDown = tenkan[i] < kijun[i] && tenkan[i - 1] >= kijun[i - 1];
+
+                if (belowCloud) reason = 'قیمت به زیر ابر Kumo رفت';
+                else if (tkCrossDown) reason = 'کراس نزولی Tenkan/Kijun';
+                else if (c.close < entry.stop) reason = `شکست حد ضرر ATR (${Math.round(entry.stop).toLocaleString()})`;
+                else if (trend === 'نزولی') reason = `روند ${htfName} نزولی شد`;
+                else if (bars >= p.maxHoldBars) reason = `سقف زمانی ${p.maxHoldBars} کندل`;
+                if (reason) {
+                    position = null; signalType = 'EXIT_LONG';
+                    const tr = trades[trades.length - 1]; if (tr) { tr.exitDate = c.time; tr.exitPrice = c.close; tr.pnlPct = (c.close / tr.entryPrice - 1) * 100; tr.exitReason = reason; }
+                    entry = null; cooldown = p.cooldownBars;
+                }
+            } else {
+                if (cooldown > 0) cooldown--;
+                else if (trend === 'صعودی' && inEntryWindow(c.time, ctx && ctx.entryWindow)) {
+                    const tkCrossUp = tenkan[i] > kijun[i] && tenkan[i - 1] <= kijun[i - 1];
+                    const flip = h.bullish && hp && !hp.bullish;
+                    const strong = !p.requireNoLowerWick || noLowerWick(h);
+                    if (aboveCloud && greenCloud && tkBullish && flip && strong) {
+                        position = 'LONG'; signalType = 'BUY';
+                        entry = { idx: i, price: c.close, stop: c.close - p.atrMult * atr[i] };
+                        ind.stop = round(entry.stop);
+                        reason = `قیمت بالای ابر سبز Kumo + کراس صعودی Tenkan/Kijun + روند ${htfName} صعودی`;
+                        trades.push({ type: 'خرید', entryDate: c.time, entryPrice: c.close, stop: entry.stop, reason });
+                    }
+                }
+            }
+            signals.push({ time: c.time, indicators: ind, signalType, position, reason });
+        }
+        return { ha, signals, trades, htfTrend: lastTrend };
+    }
+
     // ---------------- تعریف استراتژی‌ها ----------------
     const STRATEGIES = {
         rsi50_2: {
@@ -247,6 +434,18 @@
             defaultParams: EMA_DEFAULTS,
             indicators: { overlay: ['emaFast', 'emaMid', 'emaSlow'], panel: [] },
             run: runEMAPullback
+        },
+        macd_momentum: {
+            id: 'macd_momentum', name: 'مومنتوم MACD', defaultTimeframe: '15m', htfTimeframe: '1d',
+            defaultParams: MACD_DEFAULTS,
+            indicators: { overlay: [], panel: ['macd', 'signal', 'hist'] },
+            run: runMACDMomentum
+        },
+        ichimoku_cloud: {
+            id: 'ichimoku_cloud', name: 'ابر ایچیموکو', defaultTimeframe: '30m', htfTimeframe: '1d',
+            defaultParams: ICHIMOKU_DEFAULTS,
+            indicators: { overlay: ['tenkan', 'kijun'], panel: [] },
+            run: runIchimoku
         }
     };
 
@@ -254,6 +453,8 @@
         const p = { ...(STRATEGIES[id] ? STRATEGIES[id].defaultParams : {}), ...(params || {}) };
         if (id === 'rsi50_2') return Math.max(p.rsiSlowPeriod, p.atrPeriod) + p.lookback + 2;
         if (id === 'ema_heikin') return Math.max(p.emaSlow, p.atrPeriod) + p.lookback + 2;
+        if (id === 'macd_momentum') return Math.max(p.macdSlow, p.macdSignal, p.atrPeriod) + 5;
+        if (id === 'ichimoku_cloud') return Math.max(p.senkouBPeriod, p.atrPeriod) + 3;
         return 10;
     }
     function getRequiredHtfCandles(id, params) {
@@ -263,8 +464,8 @@
 
     return {
         calculateHeikinAshi, calculateSimpleCandles, getDisplayCandles,
-        calculateRSI, calculateEMA, calculateATR,
+        calculateRSI, calculateEMA, calculateATR, calculateMACD, calculateIchimoku,
         aggregateCandles, TIMEFRAME_MINUTES, getRequiredCandles, getRequiredHtfCandles,
-        runRSIPullback, runEMAPullback, STRATEGIES
+        runRSIPullback, runEMAPullback, runMACDMomentum, runIchimoku, STRATEGIES
     };
 });

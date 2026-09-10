@@ -489,19 +489,6 @@ app.get('/api/status', async (req, res, next) => { try { res.json(await getDB().
 app.get('/api/signal-history', async (req, res, next) => { try { res.json(await getDB().collection('signal_history').find({}).sort({ createdAt: -1 }).limit(300).toArray()); } catch (e) { next(e); } });
 app.delete('/api/signal-history', async (req, res, next) => { try { await getDB().collection('signal_history').deleteMany({}); res.json({ success: true }); } catch (e) { next(e); } });
 
-function computeStats(trades) {
-    const closed = trades.filter(t => t.status === 'closed' && typeof t.pnlPct === 'number');
-    const wins = closed.filter(t => t.pnlPct > 0), losses = closed.filter(t => t.pnlPct <= 0);
-    const sum = a => a.reduce((s, t) => s + t.pnlPct, 0);
-    let eq = 0, peak = 0, maxDD = 0; closed.forEach(t => { eq += t.pnlPct; peak = Math.max(peak, eq); maxDD = Math.max(maxDD, peak - eq); });
-    const gp = sum(wins), gl = -sum(losses);
-    return { total: trades.length, closed: closed.length, open: trades.length - closed.length, winRate: closed.length ? wins.length / closed.length * 100 : 0,
-        avgPnl: closed.length ? sum(closed) / closed.length : 0, avgWin: wins.length ? gp / wins.length : 0, avgLoss: losses.length ? -gl / losses.length : 0,
-        profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0), totalPnl: sum(closed), maxDrawdown: maxDD, avgBars: closed.length ? closed.reduce((s, t) => s + (t.bars || 0), 0) / closed.length : 0 };
-}
-app.get('/api/trades', async (req, res, next) => {
-    try { const trades = await getDB().collection('trades').find({}).sort({ entryTime: -1 }).limit(500).toArray(); res.json({ trades: trades.slice(0, 200), stats: computeStats(trades) }); } catch (e) { next(e); }
-});
 // بک‌تست روی کل داده‌ی موجود (کندل‌های بسته)
 async function computeStockBacktestTrades(cfg) {
     const def = STRATEGIES[cfg.strategyId]; const htfTf = cfg.htfTimeframe || '1d';
@@ -518,14 +505,7 @@ async function computeStockBacktestTrades(cfg) {
     if (open) trades.push(open);
     return { candles, htf, trades };
 }
-app.get('/api/backtest/:configId', async (req, res, next) => {
-    try {
-        const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
-        if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
-        const { candles, htf, trades } = await computeStockBacktestTrades(cfg);
-        res.json({ candles: candles.length, htfCandles: htf.length, stats: computeStats(trades), trades: trades.slice(-100) });
-    } catch (e) { next(e); }
-});
+
 app.get('/api/backtest-option/:configId', async (req, res, next) => {
     try {
         const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
@@ -591,20 +571,11 @@ async function evaluateStrategyConfig(config, marketInfo) {
     await db.collection('signal_history').insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, strategyName: def.name, timeframe: config.timeframe, signalType: last.signalType, price: lastPrice, time: last.time, reason: last.reason || null, htfTrend: result.htfTrend || null, inWindow, queue: info ? info.queue : null, incomplete: !!(lastHa && lastHa.complete === false), createdAt: new Date() });
     await bumpDayStat('signals');
 
-    const tradesColl = db.collection('trades');
     if (last.signalType === 'BUY') {
-        let tradeId = null;
-        if (!await tradesColl.findOne({ configId, status: 'open' })) {
-            const ins = await tradesColl.insertOne({ configId, symbol: config.symbol, strategyId: config.strategyId, timeframe: config.timeframe, entryTime: last.time, entryPrice: lastPrice, entryIdx: candles.length - 1, reason: last.reason || null, inWindow, status: 'open', createdAt: new Date() });
-            tradeId = ins.insertedId;
-        }
         if (inWindow && !(info && info.queue === 'buy')) {
-            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId }); }
+            try { await Options.onBuySignal({ config, indicators: last.indicators, price: lastPrice, liveS: info ? info.price : null, tradeId: null }); }
             catch (e) { console.error('❌ انتخاب آپشن:', e.message); await notify(`⚠️ انتخاب قرارداد آپشن برای ${config.symbol} ناموفق: ${e.message}`); }
         } else await notify(`ℹ️ ${config.symbol}: به‌دلیل ${!inWindow ? 'خارج از بازه‌ی ورود' : 'صف خرید'} قرارداد آپشن پیشنهاد نشد.`);
-    } else {
-        const open = await tradesColl.findOne({ configId, status: 'open' });
-        if (open) await tradesColl.updateOne({ _id: open._id }, { $set: { exitTime: last.time, exitPrice: lastPrice, pnlPct: (lastPrice / open.entryPrice - 1) * 100, bars: candles.length - 1 - (open.entryIdx || 0), exitReason: last.reason || null, status: 'closed', closedAt: new Date() } });
     }
 }
 async function evaluateAll(marketInfo) {

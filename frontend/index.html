@@ -3,98 +3,182 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>پایش سیگنال‌های معاملاتی</title>
+<title>شکارچی آپشن</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
+    /* ====== تم‌ها ====== */
+    :root {
+        --bg: #0e1013;
+        --bg-card: #14161a;
+        --bg-input: #0e1013;
+        --border: #21242a;
+        --border-light: #2a2e35;
+        --text: #dfe2e6;
+        --text-dim: #7d8590;
+        --text-bright: #f0f2f5;
+        --accent: #3d7dd8;
+        --accent-hover: #326ec2;
+        --good: #2ea88a;
+        --bad: #d9534f;
+        --warn: #c9973d;
+    }
+    [data-theme="light"] {
+        --bg: #f5f6f8;
+        --bg-card: #ffffff;
+        --bg-input: #f0f1f4;
+        --border: #e2e4e8;
+        --border-light: #d1d4da;
+        --text: #2c2f35;
+        --text-dim: #7a7f8a;
+        --text-bright: #1a1d22;
+        --accent: #3d7dd8;
+        --accent-hover: #2f6bc4;
+        --good: #1e8a6e;
+        --bad: #c9433e;
+        --warn: #b8862a;
+    }
+    [data-theme="stone"] {
+        --bg: #2b2b2b;
+        --bg-card: #333333;
+        --bg-input: #262626;
+        --border: #404040;
+        --border-light: #4a4a4a;
+        --text: #e0e0e0;
+        --text-dim: #9a9a9a;
+        --text-bright: #f5f5f5;
+        --accent: #c9973d;
+        --accent-hover: #b8862a;
+        --good: #4caf50;
+        --bad: #e57373;
+        --warn: #ffb74d;
+    }
+    [data-theme="deep"] {
+        --bg: #0a0f1a;
+        --bg-card: #111827;
+        --bg-input: #0d1420;
+        --border: #1e293b;
+        --border-light: #2d3a4f;
+        --text: #c9d6e8;
+        --text-dim: #6b7a90;
+        --text-bright: #e8eef7;
+        --accent: #2ea88a;
+        --accent-hover: #268f76;
+        --good: #2ea88a;
+        --bad: #ef5350;
+        --warn: #ffa726;
+    }
+
     * { box-sizing:border-box; margin:0; padding:0; }
     html, body { overflow-x:hidden; max-width:100%; }
-    body { font-family:'Vazirmatn',Tahoma,sans-serif; background:#0e1013; color:#dfe2e6; padding:24px; line-height:1.7; }
+    body { font-family:'Vazirmatn',Tahoma,sans-serif; background:var(--bg); color:var(--text); padding:24px; line-height:1.7; transition:background .3s, color .3s; }
     .container { max-width:1280px; margin:0 auto; }
-    header { text-align:center; margin-bottom:22px; }
-    header h1 { font-size:22px; font-weight:600; color:#f0f2f5; margin-bottom:4px; }
-    header p { font-size:13px; color:#7d8590; }
 
-    #bootOverlay { position:fixed; inset:0; background:#0e1013; z-index:1000; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:20px; text-align:center; }
-    .spinner { width:36px; height:36px; border:3px solid #2a2e35; border-top-color:#3d7dd8; border-radius:50%; animation:spin .8s linear infinite; }
-    @keyframes spin { to { transform:rotate(360deg);} }
-    #bootOverlay p { color:#9ba0a8; font-size:13.5px; }
+    /* ====== هدر ====== */
+    header { text-align:center; margin-bottom:22px; position:relative; }
+    .brand { font-size:30px; font-weight:700; background:linear-gradient(135deg, var(--accent), var(--good)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; letter-spacing:-0.5px; margin-bottom:2px; }
+    .brand-sub { font-size:14px; color:var(--text-dim); letter-spacing:2px; text-transform:uppercase; font-weight:500; }
 
-    .top-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; font-size:12.5px; color:#7d8590; align-items:center; }
-    .top-bar span { background:#171a1f; border:1px solid #262a31; padding:5px 12px; border-radius:6px; }
-    .top-bar b { color:#d0d3d8; font-weight:600; }
-    .top-bar b.bad { color:#d9534f; } .top-bar b.good { color:#2ea88a; } .top-bar b.warn { color:#c9973d; }
+    /* ====== منوی همبرگری ====== */
+    .hamburger-btn { position:fixed; top:18px; right:18px; z-index:1001; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; width:44px; height:44px; cursor:pointer; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; transition:all .2s; }
+    .hamburger-btn:hover { border-color:var(--accent); }
+    .hamburger-btn span { display:block; width:20px; height:2px; background:var(--text); border-radius:2px; transition:all .3s; }
+    .hamburger-btn.open span:nth-child(1) { transform:rotate(45deg) translate(5px,5px); }
+    .hamburger-btn.open span:nth-child(2) { opacity:0; }
+    .hamburger-btn.open span:nth-child(3) { transform:rotate(-45deg) translate(5px,-5px); }
 
-    .card { background:#14161a; border:1px solid #21242a; border-radius:10px; padding:18px 20px; margin-bottom:16px; }
-    .card h2 { font-size:14px; font-weight:600; color:#b8bcc2; margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid #21242a; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
-    .card h2 small { font-size:11.5px; color:#7d8590; font-weight:400; }
+    .menu-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:999; opacity:0; visibility:hidden; transition:all .3s; }
+    .menu-overlay.open { opacity:1; visibility:visible; }
+
+    .menu-panel { position:fixed; top:0; right:-320px; width:300px; height:100vh; background:var(--bg-card); border-left:1px solid var(--border); z-index:1000; transition:right .3s ease; display:flex; flex-direction:column; overflow-y:auto; padding:20px; }
+    .menu-panel.open { right:0; }
+    .menu-panel h3 { font-size:16px; color:var(--text-bright); margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+    .menu-item { display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:8px; cursor:pointer; font-size:14px; color:var(--text); transition:background .15s; border:none; background:transparent; width:100%; text-align:right; font-family:inherit; }
+    .menu-item:hover { background:var(--border); }
+    .menu-item .icon { font-size:16px; width:22px; text-align:center; }
+    .menu-divider { height:1px; background:var(--border); margin:12px 0; }
+    .menu-label { font-size:11px; color:var(--text-dim); padding:4px 14px; text-transform:uppercase; letter-spacing:1px; }
+
+    /* ====== کارت ====== */
+    .card { background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:16px; transition:background .3s, border-color .3s; }
+    .card h2 { font-size:14px; font-weight:600; color:var(--text-dim); margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+    .card h2 small { font-size:11.5px; color:var(--text-dim); font-weight:400; }
     .card.collapsible { padding:0; }
     .card.collapsible > h2 { margin:0; padding:13px 20px; border-bottom:none; cursor:pointer; user-select:none; flex-wrap:nowrap; }
-    .card.collapsible > h2:hover { background:#171a1f; }
-    .card.collapsible > h2 .chev { transition:transform .2s; color:#7d8590; font-size:12px; margin-right:auto; }
+    .card.collapsible > h2:hover { background:var(--border); }
+    .card.collapsible > h2 .chev { transition:transform .2s; color:var(--text-dim); font-size:12px; margin-right:auto; }
     .card.collapsible.open > h2 .chev { transform:rotate(180deg); }
-    .card.collapsible > .card-body { display:none; padding:4px 20px 18px; border-top:1px solid #21242a; }
+    .card.collapsible > .card-body { display:none; padding:4px 20px 18px; border-top:1px solid var(--border); }
     .card.collapsible.open > .card-body { display:block; }
     .h2-title { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-    .count-pill { background:#22262d; color:#b8bcc2; padding:1px 9px; border-radius:20px; font-size:11.5px; font-weight:500; }
+    .count-pill { background:var(--border); color:var(--text-dim); padding:1px 9px; border-radius:20px; font-size:11.5px; font-weight:500; }
 
+    /* ====== فرم‌ها ====== */
     .form-row { display:flex; flex-wrap:wrap; gap:14px; align-items:end; margin-bottom:10px; }
     .field { display:flex; flex-direction:column; gap:6px; min-width:150px; position:relative; }
-    .field label { font-size:12.5px; color:#8b909a; }
-    .field input, .field select { background:#0e1013; border:1px solid #2a2e35; color:#dfe2e6; padding:9px 12px; border-radius:6px; font-family:inherit; font-size:13.5px; width:100%; }
-    .field input:focus, .field select:focus { outline:none; border-color:#3d7dd8; }
-    .hint { font-size:11.5px; color:#7d8590; margin-top:-4px; margin-bottom:8px; }
+    .field label { font-size:12.5px; color:var(--text-dim); }
+    .field input, .field select { background:var(--bg-input); border:1px solid var(--border-light); color:var(--text); padding:10px 14px; border-radius:8px; font-family:inherit; font-size:13.5px; width:100%; transition:border-color .2s, box-shadow .2s; -webkit-appearance:none; -moz-appearance:none; appearance:none; }
+    .field select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%237d8590' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:left 12px center; padding-left:32px; }
+    .field input:focus, .field select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(61,125,216,.15); }
+    .hint { font-size:11.5px; color:var(--text-dim); margin-top:-4px; margin-bottom:8px; }
 
-    .autocomplete-list { position:absolute; top:100%; right:0; left:0; z-index:30; background:#1a1d22; border:1px solid #2a2e35; border-radius:6px; margin-top:4px; max-height:200px; overflow-y:auto; display:none; }
-    .autocomplete-list div { padding:8px 12px; cursor:pointer; font-size:13px; }
-    .autocomplete-list div:hover { background:#22262d; }
-    .autocomplete-list small { color:#7d8590; margin-right:6px; }
+    .autocomplete-list { position:absolute; top:100%; right:0; left:0; z-index:30; background:var(--bg-card); border:1px solid var(--border-light); border-radius:8px; margin-top:4px; max-height:200px; overflow-y:auto; display:none; box-shadow:0 8px 24px rgba(0,0,0,.3); }
+    .autocomplete-list div { padding:9px 14px; cursor:pointer; font-size:13px; transition:background .1s; }
+    .autocomplete-list div:hover { background:var(--border); }
+    .autocomplete-list small { color:var(--text-dim); margin-right:6px; }
 
-    .btn { background:#3d7dd8; color:#fff; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:500; font-family:inherit; font-size:13.5px; transition:background .15s; }
-    .btn:hover { background:#326ec2; }
+    /* ====== دکمه‌ها ====== */
+    .btn { background:var(--accent); color:#fff; border:none; padding:10px 20px; border-radius:8px; cursor:pointer; font-weight:500; font-family:inherit; font-size:13.5px; transition:all .15s; }
+    .btn:hover { background:var(--accent-hover); }
     .btn:disabled { opacity:.4; cursor:not-allowed; }
-    .btn.outline { background:transparent; border:1px solid #2a2e35; color:#b0b4bb; }
-    .btn.outline:hover { background:#1a1d22; }
-    .btn.danger { background:#8a3d3d; } .btn.danger:hover { background:#763333; }
+    .btn.outline { background:transparent; border:1px solid var(--border-light); color:var(--text); }
+    .btn.outline:hover { background:var(--border); }
+    .btn.danger { background:var(--bad); } .btn.danger:hover { background:#763333; }
     .btn.small { padding:6px 12px; font-size:12px; }
     .btn.tiny { padding:3px 8px; font-size:11px; }
 
+    /* ====== چیپ‌ها ====== */
     .symbol-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:6px; }
-    .chip { display:flex; align-items:center; gap:6px; background:#0e1013; border:1px solid #262a31; border-radius:7px; padding:6px 8px 6px 6px; font-size:13px; min-width:0; }
-    .chip-sym { font-weight:600; color:#e5e8ec; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
-    .chip-cnt { font-size:10.5px; color:#8b909a; background:#1a1d22; padding:1px 7px; border-radius:12px; white-space:nowrap; }
-    .chip-ic { background:transparent; border:none; color:#7d8590; cursor:pointer; font-size:13px; line-height:1; padding:2px 5px; border-radius:4px; font-family:inherit; }
-    .chip-ic:hover { color:#fff; background:#2a2e35; }
-    .chip-ic.x:hover { background:#8a3d3d; }
-    .empty-note { color:#565b64; font-size:13px; padding:12px 0; }
+    .chip { display:flex; align-items:center; gap:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; padding:6px 8px 6px 6px; font-size:13px; min-width:0; transition:border-color .15s; }
+    .chip:hover { border-color:var(--border-light); }
+    .chip-sym { font-weight:600; color:var(--text-bright); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
+    .chip-cnt { font-size:10.5px; color:var(--text-dim); background:var(--border); padding:1px 7px; border-radius:12px; white-space:nowrap; }
+    .chip-ic { background:transparent; border:none; color:var(--text-dim); cursor:pointer; font-size:13px; line-height:1; padding:2px 5px; border-radius:4px; font-family:inherit; transition:all .15s; }
+    .chip-ic:hover { color:var(--text-bright); background:var(--border-light); }
+    .chip-ic.x:hover { background:var(--bad); color:#fff; }
+    .empty-note { color:var(--text-dim); font-size:13px; padding:12px 0; }
 
+    /* ====== جدول ====== */
     .table-responsive { overflow-x:auto; -webkit-overflow-scrolling:touch; }
     table.data-table { width:100%; border-collapse:collapse; font-size:13px; min-width:600px; }
-    table.data-table th, table.data-table td { padding:9px 8px; text-align:center; border-bottom:1px solid #21242a; white-space:nowrap; }
-    table.data-table th { color:#8b909a; font-weight:500; font-size:12px; }
+    table.data-table th, table.data-table td { padding:7px 8px; text-align:center; border-bottom:1px solid var(--border); white-space:nowrap; }
+    table.data-table th { color:var(--text-dim); font-weight:500; font-size:12px; }
     .badge { padding:3px 10px; border-radius:20px; font-size:11.5px; font-weight:600; display:inline-block; }
-    .badge.long { background:rgba(46,168,138,.15); color:#2ea88a; }
-    .badge.short { background:rgba(217,83,79,.15); color:#d9534f; }
-    .badge.none { background:rgba(125,133,144,.15); color:#7d8590; }
-    .badge.warn { background:rgba(201,151,61,.15); color:#c9973d; }
+    .badge.long { background:rgba(46,168,138,.15); color:var(--good); }
+    .badge.short { background:rgba(217,83,79,.15); color:var(--bad); }
+    .badge.none { background:rgba(125,133,144,.15); color:var(--text-dim); }
+    .badge.warn { background:rgba(201,151,61,.15); color:var(--warn); }
     .action-btns { display:flex; gap:5px; justify-content:center; flex-wrap:wrap; }
-    .empty-row td { color:#565b64; padding:20px; white-space:normal; }
-    .pos { color:#2ea88a; } .neg { color:#d9534f; }
+    .empty-row td { color:var(--text-dim); padding:20px; white-space:normal; }
+    .pos { color:var(--good); } .neg { color:var(--bad); }
 
+    /* ====== آمار ====== */
     .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-bottom:14px; }
-    .stat { background:#0e1013; border:1px solid #21242a; border-radius:7px; padding:8px 10px; }
-    .stat small { display:block; color:#7d8590; font-size:11px; }
-    .stat b { font-size:15px; font-weight:600; color:#e5e8ec; }
+    .stat { background:var(--bg-input); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    .stat small { display:block; color:var(--text-dim); font-size:11px; }
+    .stat b { font-size:15px; font-weight:600; color:var(--text-bright); }
 
-    .chart-placeholder { display:flex; align-items:center; justify-content:center; min-height:280px; background:#0e1013; border-radius:8px; color:#7d8590; font-size:13px; text-align:center; padding:20px; }
+    /* ====== نمودار ====== */
+    .chart-placeholder { display:flex; align-items:center; justify-content:center; min-height:280px; background:var(--bg-input); border-radius:8px; color:var(--text-dim); font-size:13px; text-align:center; padding:20px; }
     #priceChart, #panelChart { border-radius:8px; overflow:hidden; }
-    .msg-warn { display:none; color:#c9973d; font-size:12px; margin-bottom:10px; background:rgba(201,151,61,.1); padding:8px 12px; border-radius:6px; }
-    .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11.5px; color:#9ba0a8; margin-bottom:8px; align-items:center; }
+    .msg-warn { display:none; color:var(--warn); font-size:12px; margin-bottom:10px; background:rgba(201,151,61,.1); padding:8px 12px; border-radius:6px; }
+    .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11.5px; color:var(--text-dim); margin-bottom:8px; align-items:center; }
     .legend i { display:inline-block; width:10px; height:3px; border-radius:2px; margin-left:5px; vertical-align:middle; }
-    .chart-title { font-size:12.5px; color:#7d8590; margin-bottom:6px; }
+    .chart-title { font-size:12.5px; color:var(--text-dim); margin-bottom:6px; }
 
+    /* ====== هشدار ====== */
     #alertContainer { position:fixed; top:20px; left:20px; z-index:999; display:flex; flex-direction:column; gap:8px; max-width:360px; }
     .alert-box { padding:12px 16px; border-radius:8px; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.4); animation:slideIn .2s ease; cursor:pointer; }
     .alert-box.error { background:#4a2323; border:1px solid #8a3d3d; color:#f0c9c9; }
@@ -103,33 +187,78 @@
     .alert-box.info { background:#1f2b3d; border:1px solid #3d7dd8; color:#c9dcf0; }
     @keyframes slideIn { from { opacity:0; transform:translateX(-20px);} to { opacity:1; transform:translateX(0);} }
 
+    /* ====== مودال ====== */
     .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:900; display:none; align-items:center; justify-content:center; padding:16px; }
     .modal-bg.open { display:flex; }
-    .modal { background:#14161a; border:1px solid #2a2e35; border-radius:10px; max-width:900px; width:100%; max-height:90vh; overflow:auto; padding:20px; }
+    .modal { background:var(--bg-card); border:1px solid var(--border-light); border-radius:12px; max-width:900px; width:100%; max-height:90vh; overflow:auto; padding:20px; }
     .modal h3 { font-size:15px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; }
 
-    ::-webkit-scrollbar { width:7px; height:7px; } ::-webkit-scrollbar-thumb { background:#2a2e35; border-radius:4px; }
+    /* ====== اسکرول‌بار ====== */
+    ::-webkit-scrollbar { width:7px; height:7px; } ::-webkit-scrollbar-thumb { background:var(--border-light); border-radius:4px; }
+
+    /* ====== رسپانسیو ====== */
     @media (max-width:900px) { .symbol-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
     @media (max-width:640px) {
-        body { padding:12px; } header h1 { font-size:18px; }
-        .top-bar { font-size:11px; gap:6px; } .top-bar span { padding:4px 9px; }
+        body { padding:12px; } .brand { font-size:22px; } .brand-sub { font-size:11px; }
         .field { min-width:100%; } .form-row { gap:10px; } .card { padding:14px; }
         .card.collapsible { padding:0; } .card.collapsible > h2 { padding:12px 14px; } .card.collapsible > .card-body { padding:4px 14px 14px; }
         .symbol-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
         #priceChart { height:260px !important; } #panelChart { height:120px !important; }
         #alertContainer { left:10px; right:10px; max-width:none; top:10px; }
-        table.data-table th, table.data-table td { padding:7px 6px; font-size:11.5px; }
+        table.data-table th, table.data-table td { padding:6px 5px; font-size:11.5px; }
+        .menu-panel { width:280px; }
     }
 </style>
 </head>
 <body>
 
-<div id="bootOverlay">
-    <div class="spinner"></div>
-    <p id="bootMessage">در حال اتصال به سرور... (اگر سرور خوابیده باشد، ممکن است تا ۳۰ ثانیه طول بکشد)</p>
+<div id="bootOverlay" style="position:fixed; inset:0; background:var(--bg); z-index:1000; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:20px; text-align:center;">
+    <div class="spinner" style="width:36px; height:36px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;"></div>
+    <p id="bootMessage" style="color:var(--text-dim); font-size:13.5px;">در حال اتصال به سرور... (اگر سرور خوابیده باشد، ممکن است تا ۳۰ ثانیه طول بکشد)</p>
     <button class="btn small" id="bootRetryBtn" style="display:none;" onclick="location.reload()">تلاش مجدد</button>
 </div>
 <div id="alertContainer"></div>
+
+<!-- منوی همبرگری -->
+<button class="hamburger-btn" id="hamburgerBtn" onclick="toggleMenu()">
+    <span></span><span></span><span></span>
+</button>
+<div class="menu-overlay" id="menuOverlay" onclick="toggleMenu()"></div>
+<div class="menu-panel" id="menuPanel">
+    <h3>منوی اصلی</h3>
+    <button class="menu-item" onclick="changeToken(); toggleMenu();"><span class="icon">🔑</span> تغییر توکن</button>
+    <button class="menu-item" onclick="openTradingSettings(); toggleMenu();"><span class="icon">⚙️</span> تنظیمات معاملات</button>
+    <button class="menu-item" onclick="openOptionSettings(); toggleMenu();"><span class="icon">⚙️</span> تنظیمات آپشن</button>
+    <button class="menu-item" onclick="openLogs('memory'); toggleMenu();"><span class="icon">📋</span> لاگ سیستم</button>
+    <button class="menu-item" onclick="testTelegram(); toggleMenu();"><span class="icon">📨</span> تست تلگرام</button>
+    <button class="menu-item" onclick="evaluateNow(); toggleMenu();"><span class="icon">⚡</span> ارزیابی الان</button>
+    <button class="menu-item" onclick="runBackupNow(); toggleMenu();"><span class="icon">💾</span> بکاپ</button>
+    <button class="menu-item" onclick="openArchiveStatus(); toggleMenu();"><span class="icon">🗄</span> آرشیو</button>
+    <div class="menu-divider"></div>
+    <div class="menu-label">وضعیت سرور</div>
+    <div style="padding:6px 14px; display:flex; flex-wrap:wrap; gap:6px;">
+        <span style="background:var(--bg-input); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:12px;">
+            سرور: <b id="backendStatus" style="font-weight:600;">در حال بررسی</b>
+        </span>
+        <span style="background:var(--bg-input); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:12px;">
+            بازار: <b id="marketStatus">-</b>
+        </span>
+        <span style="background:var(--bg-input); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:12px;">
+            مصرف API: <b id="usageAllSymbols">-</b>
+        </span>
+        <span style="background:var(--bg-input); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:12px;">
+            سلامت: <b id="healthStatus">-</b>
+        </span>
+    </div>
+    <div class="menu-divider"></div>
+    <div class="menu-label">تم</div>
+    <div style="padding:6px 14px; display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="btn tiny outline" onclick="setTheme('dark')" style="flex:1;">تاریک</button>
+        <button class="btn tiny outline" onclick="setTheme('light')" style="flex:1;">روشن</button>
+        <button class="btn tiny outline" onclick="setTheme('stone')" style="flex:1;">سنگی</button>
+        <button class="btn tiny outline" onclick="setTheme('deep')" style="flex:1;">دیپ</button>
+    </div>
+</div>
 
 <div class="modal-bg" id="modalBg" onclick="if(event.target===this) closeModal()">
     <div class="modal">
@@ -140,26 +269,9 @@
 
 <div class="container">
     <header>
-        <h1>پایش سیگنال‌های معاملاتی</h1>
-        <p>فقط کندل‌های بسته‌شده · فیلتر روند تایم‌فریم بالا · فقط سیگنال کال (خرید / خروج)</p>
+        <div class="brand">شکارچی آپشن</div>
+        <div class="brand-sub">Option Hunter</div>
     </header>
-
-    <div class="top-bar">
-        <span>سرور: <b id="backendStatus">در حال بررسی</b></span>
-        <span>بازار: <b id="marketStatus">-</b></span>
-        <span>بازه‌ی ورود: <b id="entryWindow">-</b></span>
-        <span>مصرف API: <b id="usageAllSymbols">-</b></span>
-        <span>سلامت: <b id="healthStatus">-</b></span>
-        <span>دیتابیس: <b id="storageStatus">-</b></span>
-        <button class="btn small outline" onclick="changeToken()">🔑 توکن</button>
-        <button class="btn small outline" onclick="openTradingSettings()">⚙️ تنظیمات معاملات</button>
-        <button class="btn small outline" onclick="openOptionSettings()">⚙️ تنظیمات آپشن</button>
-        <button class="btn small outline" onclick="openLogs('memory')">📋 لاگ</button>
-        <button class="btn small outline" onclick="testTelegram()">📨 تست تلگرام</button>
-        <button class="btn small outline" onclick="evaluateNow()">⚡ ارزیابی الان</button>
-        <button class="btn small outline" onclick="runBackupNow()">💾 بکاپ</button>
-        <button class="btn small outline" onclick="openArchiveStatus()">🗄 آرشیو</button>
-    </div>
 
     <div class="card collapsible" id="cardSymbols">
         <h2 onclick="toggleCard('cardSymbols')">
@@ -209,24 +321,13 @@
     </div>
 
     <div class="card">
-        <h2>نمودار <span id="chartSymbolLabel" style="color:#7d8590; font-weight:400;"></span><button class="btn small outline" onclick="resetZoom()">فیت</button></h2>
+        <h2>نمودار <span id="chartSymbolLabel" style="color:var(--text-dim); font-weight:400;"></span><button class="btn small outline" onclick="resetZoom()">فیت</button></h2>
         <div class="msg-warn" id="insufficientDataMsg"></div>
         <div class="legend" id="chartLegend"></div>
         <div id="priceChartWrapper"><div class="chart-placeholder">برای مشاهده، در جدول بالا روی «نمودار» کلیک کنید.</div></div>
         <div id="panelChartWrapper" style="display:none; margin-top:18px;">
             <div class="chart-title" id="panelTitle"></div>
             <div id="panelChart" style="height:180px;"></div>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>معاملات ثبت‌شده (فوروارد‌تست زنده) <small>بر اساس سیگنال‌های واقعی ارسال‌شده؛ بازده = حرکت سهم پایه</small></h2>
-        <div class="stats-grid" id="tradeStats"></div>
-        <div class="table-responsive">
-        <table class="data-table">
-            <thead><tr><th>نماد</th><th>استراتژی</th><th>ورود</th><th>قیمت ورود</th><th>خروج</th><th>قیمت خروج</th><th>بازده</th><th>کندل</th><th>دلیل ورود</th><th>دلیل خروج</th></tr></thead>
-            <tbody id="tradesBody"><tr class="empty-row"><td colspan="10">معامله‌ای ثبت نشده است</td></tr></tbody>
-        </table>
         </div>
     </div>
 
@@ -260,14 +361,41 @@ const PARAM_LABELS = {
     rsiFastPeriod:'دوره RSI سریع', rsiSlowPeriod:'دوره RSI کند', rsiOversold:'آستانه اشباع فروش RSI', rsiOverbought:'آستانه اشباع خرید RSI',
     lookback:'تعداد کندل نگاه به عقب', maxHoldBars:'حداکثر کندل نگه‌داری', cooldownBars:'کندل استراحت پس از خروج',
     emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', pullbackPct:'حداکثر فاصله از EMA سریع (٪)', exitBufferPct:'بافر خروج (٪)',
+    macdFast:'دوره MACD سریع', macdSlow:'دوره MACD کند', macdSignal:'دوره Signal',
+    tenkanPeriod:'دوره Tenkan-sen', kijunPeriod:'دوره Kijun-sen', senkouBPeriod:'دوره Senkou Span B',
     htfEma:'EMA تایم‌فریم بالا', htfRsiPeriod:'RSI تایم‌فریم بالا', atrPeriod:'دوره ATR', atrMult:'ضریب ATR', requireNoLowerWick:'کندل HA بدون سایه پایین (1/0)'
 };
-const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر', htfEma:'EMA بالا' };
+const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر', htfEma:'EMA بالا',
+    macd:'MACD', signal:'Signal', hist:'هیستوگرام', tenkan:'Tenkan', kijun:'Kijun', spanA:'Span A', spanB:'Span B' };
 const COLORS = ['#3d7dd8','#c9973d','#b565d9','#2ea88a','#d9534f'];
 
 let strategiesInfo = [], monitoredSymbols = [], configs = [], statusMap = {};
 let selectedConfigId = null;
 let priceChart = null, panelChart = null, candleSeries = null, overlaySeries = {}, panelSeries = {}, chartConfigId = null;
+let currentTheme = localStorage.getItem('theme') || 'dark';
+
+// ---------- تم ----------
+function setTheme(t) {
+    currentTheme = t;
+    localStorage.setItem('theme', t);
+    document.documentElement.setAttribute('data-theme', t);
+    // به‌روزرسانی رنگ نمودار اگر باز است
+    if (priceChart && candleSeries) {
+        try {
+            priceChart.applyOptions({ layout: { background: { color: getComputedStyle(document.documentElement).getPropertyValue('--bg-card').trim() }, textColor: getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim() } });
+            panelChart && panelChart.applyOptions({ layout: { background: { color: getComputedStyle(document.documentElement).getPropertyValue('--bg-card').trim() }, textColor: getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim() } });
+        } catch (e) {}
+    }
+}
+// بارگذاری تم ذخیره‌شده
+setTheme(currentTheme);
+
+// ---------- منوی همبرگری ----------
+function toggleMenu() {
+    document.getElementById('hamburgerBtn').classList.toggle('open');
+    document.getElementById('menuPanel').classList.toggle('open');
+    document.getElementById('menuOverlay').classList.toggle('open');
+}
 
 // ---------- هشدار ----------
 const activeAlerts = new Set();
@@ -293,6 +421,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 // ---------- احراز هویت ----------
 function getToken() { return localStorage.getItem('adminToken') || ''; }
 function changeToken() { const t = prompt('توکن ادمین (ADMIN_TOKEN روی سرور):', getToken()); if (t !== null) { localStorage.setItem('adminToken', t.trim()); showAlert('توکن ذخیره شد.', 'success', 3000); } }
+
 async function testTelegram() {
     try { await apiFetch(`${BACKEND_URL}/api/telegram/test`, { method:'POST' }); showAlert('پیام تست ارسال شد؛ تلگرام را چک کنید.', 'success', 5000); }
     catch (e) { showAlert('خطا در ارسال تست: ' + e.message); }
@@ -302,7 +431,7 @@ async function evaluateNow() {
     try {
         await apiFetch(`${BACKEND_URL}/api/evaluate-now`, { method:'POST' }, 0);
         showAlert('ارزیابی انجام شد.', 'success', 4000);
-        await Promise.all([loadConfigs(), loadTrades(), loadSignalHistory(), loadOptionPositions(), checkBackendStatus()]);
+        await Promise.all([loadConfigs(), loadSignalHistory(), loadOptionPositions(), checkBackendStatus()]);
     } catch (e) { showAlert('خطا در ارزیابی: ' + e.message, 'error', 8000); }
 }
 async function runBackupNow() {
@@ -310,11 +439,11 @@ async function runBackupNow() {
     catch (e) { showAlert('خطا در ارسال بکاپ: ' + e.message); }
 }
 async function openArchiveStatus() {
-    openModal('وضعیت آرشیو دیتابیس', '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال دریافت...</div>');
+    openModal('وضعیت آرشیو دیتابیس', '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال دریافت...</div>');
     try {
         const d = await apiFetch(`${BACKEND_URL}/api/archive/status`);
         const rows = d.archives.length ? d.archives.map((a,i) => `<tr><td>آرشیو ${i+1}</td><td>${a.error?'خطا: '+esc(a.error):(a.mb??'-')+' MB'}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="2">هیچ دیتابیس آرشیوی تنظیم نشده است</td></tr>';
-        openModal('وضعیت آرشیو دیتابیس', `<div class="hint">وقتی دیتابیس اصلی نزدیک سقف ۵۱۲ مگابایتی برسد، داده‌های قدیمی (کندل پایه، اسنپ‌شات آپشن، پیام تلگرام، لاگ) به‌جای حذف، به این دیتابیس‌ها منتقل می‌شوند. آستانه‌ی «پر» بودن هر آرشیو: ${d.safetyMB} مگابایت.</div>
+        openModal('وضعیت آرشیو دیتابیس', `<div class="hint">وقتی دیتابیس اصلی نزدیک سقف برسد، داده‌های قدیمی به این دیتابیس‌ها منتقل می‌شوند.</div>
             <table class="data-table"><thead><tr><th>دیتابیس</th><th>حجم</th></tr></thead><tbody>${rows}</tbody></table>
             <button class="btn small" style="margin-top:10px;" onclick="runArchiveNow()">اجرای آرشیو الان</button>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
@@ -372,20 +501,25 @@ let warnedTelegram = false, warnedToken = false;
 async function checkBackendStatus() {
     try {
         const d = await apiFetch(`${BACKEND_URL}/`);
-        const bs = document.getElementById('backendStatus'); bs.textContent = (d.apiKeysConfigured ? `متصل (${d.apiKeysConfigured} کلید)` : 'کلید تنظیم نشده') + ` · ${d.version || '?'}`; bs.className = d.apiKeysConfigured ? 'good' : 'bad';
-        if (d.version !== EXPECTED_SERVER_VERSION) { bs.className = 'bad'; showAlert(`نسخه‌ی سرور (${d.version}) با فرانت (${EXPECTED_SERVER_VERSION}) یکی نیست — احتمالاً آخرین دیپلوی روی Render شکست خورده. تب Events/Logs در Render را ببینید.`, 'error', 20000); }
-        const ms = document.getElementById('marketStatus'); ms.innerHTML = d.holidayToday ? 'تعطیل (تشخیص خودکار) <button class="btn tiny outline" onclick="clearHoliday()">لغو</button>' : d.marketOpenNow ? 'باز' : 'بسته'; ms.className = d.marketOpenNow ? 'good' : d.holidayToday ? 'warn' : '';
-        document.getElementById('entryWindow').textContent = d.entryWindow || '-';
+        const bs = document.getElementById('backendStatus');
+        bs.textContent = d.apiKeysConfigured ? 'متصل' : 'قطع';
+        bs.style.color = d.apiKeysConfigured ? 'var(--good)' : 'var(--bad)';
+        const ms = document.getElementById('marketStatus');
+        ms.innerHTML = d.holidayToday ? 'تعطیل' : d.marketOpenNow ? 'باز' : 'بسته';
+        ms.style.color = d.marketOpenNow ? 'var(--good)' : d.holidayToday ? 'var(--warn)' : 'var(--text-dim)';
         const hs = document.getElementById('healthStatus');
-        if (d.health && d.health.consecutiveFailures >= 5) { hs.textContent = `خراب (${d.health.consecutiveFailures} خطا)`; hs.className = 'bad'; }
-        else if (d.pendingOutbox > 0) { hs.textContent = `${d.pendingOutbox} پیام در صف تلگرام`; hs.className = 'warn'; }
-        else { hs.textContent = 'سالم'; hs.className = 'good'; }
+        if (d.health && d.health.consecutiveFailures >= 5) { hs.textContent = `خراب`; hs.style.color = 'var(--bad)'; }
+        else if (d.pendingOutbox > 0) { hs.textContent = `${d.pendingOutbox} در صف`; hs.style.color = 'var(--warn)'; }
+        else { hs.textContent = 'سالم'; hs.style.color = 'var(--good)'; }
         if (!d.telegramConfigured && !warnedTelegram) { warnedTelegram = true; showAlert('تلگرام روی سرور تنظیم نشده؛ سیگنال‌ها ارسال نمی‌شوند.', 'warn', 12000); }
         if (!d.adminRequired && !warnedToken) { warnedToken = true; showAlert('ADMIN_TOKEN روی سرور تنظیم نشده؛ هر کسی می‌تواند تنظیمات را تغییر دهد.', 'warn', 12000); }
         const u = await apiFetch(`${BACKEND_URL}/api/usage`);
-        document.getElementById('usageAllSymbols').textContent = `${u.total}/${u.totalLimit} (${u.keys.map(k => k.count).join('·')})`;
+        document.getElementById('usageAllSymbols').textContent = `${u.total}/${u.totalLimit}`;
         if (u.total >= u.totalLimit) showAlert('سهمیه‌ی روزانه‌ی همه‌ی کلیدهای API تمام شد.', 'error');
-    } catch (e) { const bs = document.getElementById('backendStatus'); bs.textContent = 'قطع'; bs.className = 'bad'; showAlert('عدم دسترسی به سرور: ' + e.message); }
+    } catch (e) {
+        const bs = document.getElementById('backendStatus'); bs.textContent = 'قطع'; bs.style.color = 'var(--bad)';
+        showAlert('عدم دسترسی به سرور: ' + e.message);
+    }
 }
 
 // ---------- جستجوی نماد ----------
@@ -435,7 +569,7 @@ async function importDaily(sym) {
     showAlert(`در حال دریافت تاریخچه‌ی روزانه‌ی «${sym}»...`, 'info', 4000);
     try {
         const r = await apiFetch(`${BACKEND_URL}/api/import-daily/${encodeURIComponent(sym)}`, { method:'POST' }, 0);
-        showAlert(`«${sym}»: ${r.added} کندل روزانه اضافه شد (از ${r.total}). برای بروزرسانی فوری «پایش‌های فعال»، «⚡ ارزیابی الان» را بزنید.`, 'success', 8000);
+        showAlert(`«${sym}»: ${r.added} کندل روزانه اضافه شد (از ${r.total}).`, 'success', 8000);
         await Promise.all([loadMonitoredSymbols(), loadConfigs()]);
     } catch (e) { showAlert('خطا در وارد کردن تاریخچه: ' + e.message, 'error', 10000); }
 }
@@ -503,7 +637,7 @@ function renderConfigs() {
             <td>${st && st.price ? st.price.toLocaleString() : '-'}</td><td style="font-size:11px;">${ind}</td><td>${data}</td>
             <td>${st && st.updatedAt ? new Date(st.updatedAt).toLocaleTimeString('fa-IR') : '-'}</td>
             <td><input type="checkbox" ${it.enabled?'checked':''} onchange="toggleConfigEnabled('${id}', this.checked)"></td>
-<td class="action-btns"><button class="btn small outline" onclick="viewChart('${id}')">نمودار</button><button class="btn small outline" onclick="runBacktest('${id}')">بک‌تست</button><button class="btn small outline" onclick="runOptionBacktest('${id}')">بک‌تست آپشن</button><button class="btn small outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn small danger" onclick="deleteConfig('${id}')">حذف</button></td>
+<td class="action-btns"><button class="btn small outline" onclick="viewChart('${id}')">نمودار</button><button class="btn small outline" onclick="runOptionBacktest('${id}')">بک‌تست آپشن</button><button class="btn small outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn small danger" onclick="deleteConfig('${id}')">حذف</button></td>
         </tr>`;
     }).join('');
 }
@@ -513,56 +647,18 @@ async function deleteConfig(id) {
     try { await apiFetch(`${BACKEND_URL}/api/strategy-configs/${id}`, { method:'DELETE' }); if (selectedConfigId === id) selectedConfigId = null; await loadConfigs(); } catch (e) { showAlert('خطا: ' + e.message); }
 }
 
-// ---------- بک‌تست ----------
-function statsHtml(s) {
-    const pf = s.profitFactor === Infinity ? '∞' : s.profitFactor.toFixed(2);
-    return `<div class="stats-grid">
-        <div class="stat"><small>معاملات (بسته/باز)</small><b>${s.closed} / ${s.open}</b></div>
-        <div class="stat"><small>وین‌ریت</small><b>${s.winRate.toFixed(0)}٪</b></div>
-        <div class="stat"><small>بازده کل</small><b>${pct(s.totalPnl)}</b></div>
-        <div class="stat"><small>میانگین هر معامله</small><b>${pct(s.avgPnl)}</b></div>
-        <div class="stat"><small>میانگین سود / زیان</small><b>${pct(s.avgWin)} / ${pct(s.avgLoss)}</b></div>
-        <div class="stat"><small>Profit Factor</small><b>${pf}</b></div>
-        <div class="stat"><small>حداکثر افت</small><b class="neg">${s.maxDrawdown.toFixed(2)}٪</b></div>
-        <div class="stat"><small>میانگین مدت (کندل)</small><b>${s.avgBars.toFixed(1)}</b></div></div>`;
-}
-async function runBacktest(id) {
-    const it = configs.find(c => c._id === id); if (!it) return;
-    openModal(`بک‌تست ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال محاسبه...</div>');
-    try {
-        const r = await apiFetch(`${BACKEND_URL}/api/backtest/${id}`);
-        const rows = r.trades.length ? r.trades.slice().reverse().map(t => `<tr><td>${fmtT(t.entryTime)}</td><td>${t.entryPrice.toLocaleString()}</td><td>${t.exitTime?fmtT(t.exitTime):'<span class="badge long">باز</span>'}</td><td>${t.exitPrice?t.exitPrice.toLocaleString():'-'}</td><td>${pct(t.pnlPct)}</td><td>${t.bars??'-'}</td><td style="font-size:11px;">${esc(t.reason||'-')}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="8">هیچ معامله‌ای در داده‌ی موجود تولید نشد</td></tr>';
-        openModal(`بک‌تست ${it.symbol} — ${TF_LABELS[it.timeframe]} → ${TF_LABELS[it.htfTimeframe||'1d']}`, `
-            <div class="hint">روی ${r.candles} کندل بسته‌ی ${TF_LABELS[it.timeframe]} و ${r.htfCandles} کندل ${TF_LABELS[it.htfTimeframe||'1d']}. بازده = حرکت سهم پایه (نه آپشن)، بدون کارمزد. با داده‌ی کم، نتیجه قابل اتکا نیست.</div>
-            ${statsHtml(r.stats)}
-            <div class="table-responsive"><table class="data-table"><thead><tr><th>ورود</th><th>قیمت</th><th>خروج</th><th>قیمت</th><th>بازده</th><th>کندل</th><th>دلیل ورود</th><th>دلیل خروج</th></tr></thead><tbody>${rows}</tbody></table></div>`);
-    } catch (e) { openModal('خطا در بک‌تست', `<div class="empty-note">${esc(e.message)}</div>`); }
-}
+// ---------- بک‌تست آپشن ----------
 async function runOptionBacktest(id) {
     const it = configs.find(c => c._id === id); if (!it) return;
-    openModal(`بک‌تست آپشن (تقریبی) ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال محاسبه...</div>');
+    openModal(`بک‌تست آپشن (تقریبی) ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال محاسبه...</div>');
     try {
         const r = await apiFetch(`${BACKEND_URL}/api/backtest-option/${id}`);
         const a = r.assumptions;
         const head = `<div class="msg-warn" style="display:block;">⚠️ کاملاً تقریبی: قرارداد فرضی ATM، سررسید فرضی ${a.assumedMaturityDays} روز، IV فرضی = ${a.ivMultiplier}×HV تاریخی، اسپرد فرضی ${a.spreadPct}٪. داده‌ی واقعی قراردادهای گذشته وجود ندارد؛ نتیجه معمولاً خوش‌بینانه‌تر از بازار واقعی است.</div>
             <div class="stats-grid"><div class="stat"><small>تعداد معامله</small><b>${r.stats.count}</b></div><div class="stat"><small>وین‌ریت</small><b>${r.stats.winRate.toFixed(0)}٪</b></div><div class="stat"><small>بازده کل</small><b>${pct(r.stats.totalPnl)}</b></div><div class="stat"><small>میانگین</small><b>${pct(r.stats.avgPnl)}</b></div><div class="stat"><small>Profit Factor</small><b>${r.stats.profitFactor===Infinity?'∞':r.stats.profitFactor.toFixed(2)}</b></div></div>`;
-        const rows = r.trades.length ? r.trades.slice().reverse().map(t => `<tr><td>${fmtT(t.entryTime)}</td><td>${fmtN(t.stockEntry)}→${fmtN(t.stockExit)}</td><td>${fmtN(t.strike)}</td><td>${(t.hv*100).toFixed(0)}٪</td><td>${t.entryDelta.toFixed(2)}</td><td>${fmtN(t.optionEntry)}→${fmtN(t.optionExit)}</td><td>${pct(t.pnlPct)}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="8">معامله‌ی بسته‌شده‌ای در بک‌تست سهم یافت نشد</td></tr>';
+        const rows = r.trades.length ? r.trades.slice().reverse().map(t => `<tr><td>${fmtT(t.entryTime)}</td><td>${fmtN(t.stockEntry)}→${fmtN(t.stockExit)}</td><td>${fmtN(t.strike)}</td><td>${(t.hv*100).toFixed(0)}٪</td><td>${t.entryDelta.toFixed(2)}</td><td>${fmtN(t.optionEntry)}→${fmtN(t.optionExit)}</td><td>${pct(t.pnlPct)}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="8">معامله‌ی بسته‌شده‌ای یافت نشد</td></tr>';
         openModal(`بک‌تست آپشن (تقریبی) ${it.symbol}`, head + `<div class="table-responsive"><table class="data-table"><thead><tr><th>ورود</th><th>سهم (ورود→خروج)</th><th>اعمال فرضی</th><th>HV</th><th>دلتا ورود</th><th>پرمیوم (ورود→خروج)</th><th>بازده آپشن</th><th>دلیل خروج</th></tr></thead><tbody>${rows}</tbody></table></div>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
-}
-
-// ---------- معاملات زنده ----------
-async function loadTrades() {
-    try {
-        const r = await apiFetch(`${BACKEND_URL}/api/trades`);
-        document.getElementById('tradeStats').innerHTML = r.stats.total ? statsHtml(r.stats).replace('<div class="stats-grid">','').replace(/<\/div>$/,'') : '<div class="empty-note">هنوز معامله‌ای ثبت نشده است</div>';
-        const tb = document.getElementById('tradesBody');
-        if (!r.trades.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="10">معامله‌ای ثبت نشده است</td></tr>';
-        tb.innerHTML = r.trades.map(t => { const s = strategiesInfo.find(x => x.id === t.strategyId); return `<tr>
-            <td>${esc(t.symbol)}</td><td>${esc(s?s.name:t.strategyId)} · ${TF_LABELS[t.timeframe]||''}</td><td>${fmtT(t.entryTime)}${t.inWindow===false?' <span class="badge warn" title="خارج از بازه ورود">⏸</span>':''}</td><td>${t.entryPrice.toLocaleString()}</td>
-            <td>${t.exitTime?fmtT(t.exitTime):'<span class="badge long">باز</span>'}</td><td>${t.exitPrice?t.exitPrice.toLocaleString():'-'}</td><td>${pct(t.pnlPct)}</td><td>${t.bars??'-'}</td>
-            <td style="font-size:11px;">${esc(t.reason||'-')}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`; }).join('');
-    } catch (e) { showAlert('خطا در بارگذاری معاملات: ' + e.message); }
 }
 
 // ---------- تاریخچه سیگنال ----------
@@ -580,7 +676,12 @@ async function clearSignalHistory() {
 }
 
 // ---------- نمودار ----------
-function chartOpts(el, h) { return { layout:{ background:{ color:'#14161a' }, textColor:'#9ba0a8', fontFamily:'Vazirmatn' }, grid:{ vertLines:{ color:'#1e2126' }, horzLines:{ color:'#1e2126' } }, timeScale:{ timeVisible:true, secondsVisible:false, tickMarkFormatter:fmtT }, localization:{ timeFormatter:fmtT }, width: el.clientWidth || 600, height: el.clientHeight || h }; }
+function chartOpts(el, h) {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-card').trim();
+    const txt = getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim();
+    const grid = getComputedStyle(document.documentElement).getPropertyValue('--border').trim();
+    return { layout:{ background:{ color:bg }, textColor:txt, fontFamily:'Vazirmatn' }, grid:{ vertLines:{ color:grid }, horzLines:{ color:grid } }, timeScale:{ timeVisible:true, secondsVisible:false, tickMarkFormatter:fmtT }, localization:{ timeFormatter:fmtT }, width: el.clientWidth || 600, height: el.clientHeight || h };
+}
 function destroyCharts() { try { priceChart && priceChart.remove(); } catch {} try { panelChart && panelChart.remove(); } catch {} priceChart = panelChart = candleSeries = null; overlaySeries = {}; panelSeries = {}; chartConfigId = null; }
 function buildCharts(meta) {
     destroyCharts();
@@ -623,7 +724,6 @@ async function viewChart(id) {
         const rebuild = chartConfigId !== id || !priceChart;
         if (rebuild) buildCharts(meta);
 
-        // کندل‌های نمایشی: بسته‌ها از استراتژی، کندل باز با رنگ کم‌رنگ
         const disp = result.ha.map(c => {
             const o = { time:c.time, open:c.open, high:c.high, low:c.low, close:c.close };
             if (c.complete === false) { o.color = 'rgba(201,151,61,.55)'; o.wickColor = 'rgba(201,151,61,.55)'; o.borderColor = 'rgba(201,151,61,.55)'; }
@@ -645,7 +745,7 @@ async function viewChart(id) {
         legend.innerHTML = [...meta.overlay.map((k,i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${IND_LABELS[k]||k}</span>`),
             ...meta.panel.map((k,i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${IND_LABELS[k]||k}</span>`),
             `<span><i style="background:rgba(125,133,144,.5)"></i>کندل باز (ارزیابی نمی‌شود)</span>`,
-            `<span><i style="background:rgba(201,151,61,.55)"></i>کندل با داده‌ی ناقص (کمتر از ۶۰٪ دقیقه‌ی موردانتظار)</span>`,
+            `<span><i style="background:rgba(201,151,61,.55)"></i>کندل با داده‌ی ناقص</span>`,
             result.htfTrend ? `<span>روند ${TF_LABELS[d.htfTimeframe]}: ${trendBadge(result.htfTrend)}</span>` : ''].join('');
 
         const msgs = [];
@@ -661,6 +761,7 @@ async function viewChart(id) {
 const OPT_LABELS = { minDays:'حداقل روز تا سررسید', maxDays:'حداکثر روز تا سررسید', maxSpreadPct:'حداکثر اسپرد (٪)', minOI:'حداقل موقعیت باز', minTrades:'حداقل معامله امروز', minPremium:'حداقل پرمیوم (ریال)', deltaMin:'حداقل دلتا', deltaMax:'حداکثر دلتا', maxIvHv:'حداکثر IV/HV', rewardRisk:'هدف = چند برابر ریسک', topN:'تعداد پیشنهاد', optionStopPct:'حد ضرر آپشن (٪)', take1Pct:'هشدار نیمه‌فروش (٪)', take2Pct:'حد سود کامل (٪)', closeDaysBefore:'بستن X روز قبل سررسید', snapshotTtlDays:'نگه‌داری اسنپ‌شات (روز)' };
 const fmtN = n => n === null || n === undefined ? '-' : Math.round(n).toLocaleString();
 const fmtIv = v => v ? (v*100).toFixed(0)+'٪' : '-';
+
 const TRADING_LABELS = {
     ENTRY_START: 'شروع بازه‌ی مجاز ورود (HH:MM)',
     ENTRY_END: 'پایان بازه‌ی مجاز ورود (HH:MM)',
@@ -712,14 +813,14 @@ async function saveOptionSettings() {
     try { await apiFetch(`${BACKEND_URL}/api/options/settings`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); closeModal(); showAlert('تنظیمات آپشن ذخیره شد.', 'success', 3000); } catch (e) { showAlert('خطا: ' + e.message); }
 }
 async function viewChain(sym) {
-    openModal(`زنجیره‌ی کال ${sym}`, '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال دریافت...</div>');
+    openModal(`زنجیره‌ی کال ${sym}`, '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال دریافت...</div>');
     try {
         const d = await apiFetch(`${BACKEND_URL}/api/options/chain/${encodeURIComponent(sym)}`);
         if (!d.rows.length) {
             let suggestHtml = '';
             try {
                 const u = await apiFetch(`${BACKEND_URL}/api/options/underlyings`);
-                suggestHtml = `<div class="hint">نام‌های جستجوشده: ${(d.matchedNames||[]).join('، ')||'-'}</div><div class="hint">نمونه نام‌های موجود در بازار آپشن: ${u.underlyings.slice(0,40).map(x=>esc(x.underlying)).join('، ')}</div>`;
+                suggestHtml = `<div class="hint">نام‌های جستجوشده: ${(d.matchedNames||[]).map(esc).join('، ')||'-'}</div><div class="hint">نمونه نام‌های موجود در بازار آپشن: ${u.underlyings.slice(0,40).map(x=>esc(x.underlying)).join('، ')}</div>`;
             } catch (e) {}
             return openModal(`زنجیره‌ی کال ${sym}`, `<div class="empty-note">قراردادی برای این نماد پیدا نشد.</div>${suggestHtml}`);
         }
@@ -729,7 +830,7 @@ async function viewChain(sym) {
 }
 async function recommendOption(id) {
     const it = configs.find(c => c._id === id); if (!it) return;
-    openModal(`پیشنهاد آپشن ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال محاسبه...</div>');
+    openModal(`پیشنهاد آپشن ${it.symbol}`, '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال محاسبه...</div>');
     try {
         const r = await apiFetch(`${BACKEND_URL}/api/options/recommend/${id}`);
         const sc = r.scenario;
@@ -752,31 +853,31 @@ async function loadOptionPositions() {
     } catch (e) { showAlert('خطا در بارگذاری موقعیت‌های آپشن: ' + e.message); }
 }
 async function deleteOptionPosition(id) { if (!confirm('این موقعیت حذف شود؟')) return; try { await apiFetch(`${BACKEND_URL}/api/options/positions/${id}`, { method:'DELETE' }); await loadOptionPositions(); } catch (e) { showAlert('خطا: ' + e.message); } }
-async function loadStorage() { try { const s = await apiFetch(`${BACKEND_URL}/api/storage`); const el = document.getElementById('storageStatus'); el.textContent = `${s.storageMB}/${s.limitMB} MB`; el.className = s.storageMB > 400 ? 'bad' : s.storageMB > 300 ? 'warn' : 'good'; } catch (e) {} }
+async function loadStorage() { try { const s = await apiFetch(`${BACKEND_URL}/api/storage`); const el = document.getElementById('storageStatus'); if (el) { el.textContent = `${s.storageMB}/${s.limitMB} MB`; el.className = s.storageMB > 400 ? 'bad' : s.storageMB > 300 ? 'warn' : 'good'; } } catch (e) {} }
 
 // ---------- لاگ ----------
 async function openLogs(source='memory') {
-    openModal('لاگ سیستم', '<div style="text-align:center;padding:30px;"><div class="spinner" style="margin:0 auto 12px;"></div>در حال دریافت...</div>');
+    openModal('لاگ سیستم', '<div style="text-align:center;padding:30px;"><div style="width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;"></div>در حال دریافت...</div>');
     try {
         let rows;
         if (source === 'client') rows = clientLogs.slice().reverse();
         else { const r = await apiFetch(`${BACKEND_URL}/api/logs?source=${source}&limit=300`); rows = r.logs; }
         const tab = (k, l) => `<button class="btn small ${source===k?'':'outline'}" onclick="openLogs('${k}')">${l}</button>`;
         const tabs = `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">${tab('memory','سرور (از آخرین ری‌استارت)')}${tab('db','خطاهای ذخیره‌شده‌ی سرور')}${tab('client','مرورگر')}</div>`;
-        const body = rows.length ? rows.map(l => `<div style="font-family:monospace;font-size:11.5px;direction:ltr;text-align:left;padding:4px 6px;border-bottom:1px solid #21242a;white-space:pre-wrap;word-break:break-all;color:${l.level==='error'?'#d9534f':l.level==='warn'?'#c9973d':'#9ba0a8'}">${new Date(l.at).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${l.level}] ${esc(l.msg)}</div>`).join('') : '<div class="empty-note">لاگی وجود ندارد</div>';
+        const body = rows.length ? rows.map(l => `<div style="font-family:monospace;font-size:11.5px;direction:ltr;text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);white-space:pre-wrap;word-break:break-all;color:${l.level==='error'?'var(--bad)':l.level==='warn'?'var(--warn)':'var(--text-dim)'}">${new Date(l.at).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${l.level}] ${esc(l.msg)}</div>`).join('') : '<div class="empty-note">لاگی وجود ندارد</div>';
         openModal(`لاگ سیستم (${rows.length})`, tabs + body);
     } catch (e) { openModal('لاگ سیستم', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
-// برای تست
+
 // ---------- شروع ----------
 window.addEventListener('load', async () => {
     if (!await waitForBackend()) { document.getElementById('bootMessage').textContent = '❌ اتصال به سرور برقرار نشد.'; document.getElementById('bootRetryBtn').style.display = 'inline-block'; return; }
     if (!await loadStrategiesLibrary()) { document.getElementById('bootMessage').textContent = '❌ بارگذاری strategies.js ناموفق بود.'; document.getElementById('bootRetryBtn').style.display = 'inline-block'; return; }
     document.getElementById('bootOverlay').style.display = 'none';
-    await checkBackendStatus(); await loadTimeframes(); await loadStrategies(); await loadMonitoredSymbols(); await loadConfigs(); await loadTrades(); await loadSignalHistory();
+    await checkBackendStatus(); await loadTimeframes(); await loadStrategies(); await loadMonitoredSymbols(); await loadConfigs(); await loadSignalHistory();
     await loadOptionPositions(); await loadStorage();
     setInterval(checkBackendStatus, 60000); setInterval(loadConfigs, 60000); setInterval(loadMonitoredSymbols, 120000);
-    setInterval(loadTrades, 120000); setInterval(loadSignalHistory, 60000);
+    setInterval(loadSignalHistory, 60000);
     setInterval(loadOptionPositions, 60000); setInterval(loadStorage, 300000);
     setInterval(() => { if (selectedConfigId) viewChart(selectedConfigId); }, 60000);
 });
