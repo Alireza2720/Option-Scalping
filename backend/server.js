@@ -142,11 +142,51 @@ function getUnderlyingNames(symbol) {
 // ---------------- آخرین قیمت‌ها (in-memory) ----------------
 const lastQuotes = new Map(); // symbol -> { price, queue, at }
 
+// کش کوتاه‌مدت برای AllSymbols تا درخواست‌های تکراری، سهمیه API رو نسوزونه
+let rawSymbolsCache = { at: 0, data: null };
+async function fetchAllSymbolsRawCached(maxAgeMs = 15000) {
+    if (rawSymbolsCache.data && Date.now() - rawSymbolsCache.at < maxAgeMs) {
+        return rawSymbolsCache.data;
+    }
+    const data = await fetchAllSymbolsRaw();
+    rawSymbolsCache = { at: Date.now(), data };
+    return data;
+}
+
 app.get('/api/quotes', (req, res) => {
     const out = {};
     for (const [sym, q] of lastQuotes) out[sym] = { price: q.price, queue: q.queue, at: q.at };
     res.json(out);
 });
+
+// ✅ دریافت آنی یک نماد بدون انتظار برای تیک بعدی
+// قیمت لحظه‌ای + ساخت کندل دقیقه‌ای و روزانه
+async function refreshSymbolData(symbol) {
+    try {
+        const raw = await fetchAllSymbolsRawCached(60000);
+        await updateSymbolsCacheFromRaw(raw);
+        const rawMap = new Map();
+        raw.forEach(s => { if (s.l18) rawMap.set(s.l18, s); });
+        const s = rawMap.get(symbol);
+        if (!s) return false;
+        const price = +s.pl;
+        if (!price) return false;
+
+        const tmax = +s.tmax || 0, tmin = +s.tmin || 0;
+        const queue = tmax > 0 && price >= tmax ? 'buy' : (tmin > 0 && price <= tmin ? 'sell' : null);
+        lastQuotes.set(symbol, { price, queue, at: new Date() });
+
+        const tehran = getTehranParts();
+        const bucket1 = getBucketTime(tehran, 1);
+        const dayTime = dayStartUTC(tehran);
+        await upsertLiveCandle(symbol, bucket1, price, 0);
+        await upsertDailyCandle(symbol, dayTime, s);
+        return true;
+    } catch (e) {
+        console.error('❌ refreshSymbolData:', e.message);
+        return false;
+    }
+}
 
 // ---------------- تلگرام با صف ارسال ----------------
 async function telegramSend(text) {
@@ -398,7 +438,10 @@ app.post('/api/monitored-symbols', async (req, res, next) => {
         const { symbol } = req.body; if (!symbol) return res.status(400).json({ error: 'symbol الزامی است' });
         const db = getDB();
         if (await db.collection('monitored_symbols').findOne({ symbol })) return res.status(400).json({ error: 'این نماد قبلاً اضافه شده است' });
-        const doc = { symbol, addedAt: new Date() }; const r = await db.collection('monitored_symbols').insertOne(doc);
+        const doc = { symbol, addedAt: new Date() };
+        const r = await db.collection('monitored_symbols').insertOne(doc);
+        // ✅ قیمت و کندل رو بلافاصله می‌سازیم تا فرانت‌اند بدون انتظار برای تیک بعدی، داده رو ببینه
+        await refreshSymbolData(symbol).catch(() => {});
         res.json({ _id: r.insertedId, ...doc });
     } catch (e) { next(e); }
 });
@@ -424,7 +467,11 @@ app.post('/api/strategy-configs', async (req, res, next) => {
         const db = getDB();
         if (!await db.collection('monitored_symbols').findOne({ symbol })) return res.status(400).json({ error: 'ابتدا نماد را به لیست زیر نظر اضافه کنید.' });
         const doc = { symbol, strategyId, timeframe, htfTimeframe: htf, candleType: candleType === 'simple' ? 'simple' : 'heikin', params: { ...STRATEGIES[strategyId].defaultParams, ...(params || {}) }, enabled: enabled !== false, createdAt: new Date() };
-        const r = await db.collection('strategy_configs').insertOne(doc); res.json({ _id: r.insertedId, ...doc });
+        const r = await db.collection('strategy_configs').insertOne(doc);
+        const fullDoc = { _id: r.insertedId, ...doc };
+        // ✅ ارزیابی فوری استراتژی جدید تا وضعیتش در جدول «لیست پایش فعال» بلافاصله دیده شود
+        await evaluateStrategyConfig(fullDoc, null).catch(e => console.error('❌ ارزیابی آنی استراتژی جدید:', e.message));
+        res.json(fullDoc);
     } catch (e) { next(e); }
 });
 app.put('/api/strategy-configs/:id', async (req, res, next) => {
@@ -567,8 +614,8 @@ async function tick() {
         if (!monitored.length) return;
         const tehran = getTehranParts();
         const bucket1 = getBucketTime(tehran, 1), dayTime = dayStartUTC(tehran);
-
-        let raw; try { raw = await fetchAllSymbolsRaw(); } catch (e) { await recordTickFailure(e.message); return; }
+       
+        let raw; try { raw = await fetchAllSymbolsRaw(); rawSymbolsCache = { at: Date.now(), data: raw }; } catch (e) { await recordTickFailure(e.message); return; }
         await updateSymbolsCacheFromRaw(raw);
 
         const active = raw.filter(s => +s.tno > 0).length;

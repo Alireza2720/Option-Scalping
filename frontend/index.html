@@ -522,9 +522,9 @@ function renderMonitoredSymbols() {
         const q = window._symbolQuotes && window._symbolQuotes[s.symbol];
         const priceHtml = q && q.price
             ? `<span>قیمت: <b>${q.price.toLocaleString()}</b></span>` +
-              (q.queue === 'buy' ? '<span class="badge warn">صف خرید</span>' : '') +
-              (q.queue === 'sell' ? '<span class="badge short">صف فروش</span>' : '')
-            : '';
+            (q.queue === 'buy' ? '<span class="badge warn">صف خرید</span>' : '') +
+            (q.queue === 'sell' ? '<span class="badge short">صف فروش</span>' : '')
+            : '<span style="opacity:.5;">در حال دریافت قیمت...</span>';
         return `<div class="symbol-item">
             <div class="sym-avatar">${esc(initial)}</div>
             <div class="sym-body">
