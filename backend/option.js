@@ -1,14 +1,24 @@
 'use strict';
 const fetch = require('node-fetch');
+const Settings = require('./settings.js');
 
 let deps = null;
 function init(d) { deps = d; }
 
 const OPTIONS_URL = process.env.OPTIONS_API_URL || 'https://s3.optionschool24.com/last?type=3';
-const RISK_FREE = +(process.env.RISK_FREE_RATE || 0.23);
-const FEE_BUY = +(process.env.OPTION_FEE_BUY || 0.0012);
-const FEE_SELL = +(process.env.OPTION_FEE_SELL || 0.0012);
 const TRADING_DAYS = 245;
+
+// این‌ها پویا هستند و از Settings خوانده می‌شوند تا از فرانت قابل تغییر باشند
+let RISK_FREE = +(process.env.RISK_FREE_RATE || 0.23);
+let FEE_BUY = +(process.env.OPTION_FEE_BUY || 0.0012);
+let FEE_SELL = +(process.env.OPTION_FEE_SELL || 0.0012);
+
+function reloadFromSettings() {
+    const s = Settings.get();
+    RISK_FREE = s.RISK_FREE_RATE;
+    FEE_BUY = s.OPTION_FEE_BUY;
+    FEE_SELL = s.OPTION_FEE_SELL;
+}
 
 const DEFAULT_SETTINGS = {
     minDays: 20, maxDays: 90, maxSpreadPct: 8, minOI: 100, minTrades: 1, minPremium: 300,
@@ -348,4 +358,4 @@ function registerRoutes(app, ObjectId) {
     app.get('/api/storage', async (req, res, next) => { try { res.json(await storageStats()); } catch (e) { next(e); } });
 }
 
-module.exports = { init, norm, ensureIndexes, registerRoutes, fetchChain, storeSnapshots, storeEOD, managePositions, onBuySignal, openPositionsCount, storageStats, positionStats, getSettings, runApproxOptionBacktest };
+module.exports = { init, norm, ensureIndexes, registerRoutes, fetchChain, storeSnapshots, storeEOD, managePositions, onBuySignal, openPositionsCount, storageStats, positionStats, getSettings, runApproxOptionBacktest, reloadFromSettings };

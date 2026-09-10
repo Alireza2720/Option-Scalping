@@ -152,6 +152,7 @@
         <span>سلامت: <b id="healthStatus">-</b></span>
         <span>دیتابیس: <b id="storageStatus">-</b></span>
         <button class="btn small outline" onclick="changeToken()">🔑 توکن</button>
+        <button class="btn small outline" onclick="openTradingSettings()">⚙️ تنظیمات معاملات</button>
         <button class="btn small outline" onclick="openOptionSettings()">⚙️ تنظیمات آپشن</button>
         <button class="btn small outline" onclick="openLogs('memory')">📋 لاگ</button>
         <button class="btn small outline" onclick="testTelegram()">📨 تست تلگرام</button>
@@ -660,6 +661,43 @@ async function viewChart(id) {
 const OPT_LABELS = { minDays:'حداقل روز تا سررسید', maxDays:'حداکثر روز تا سررسید', maxSpreadPct:'حداکثر اسپرد (٪)', minOI:'حداقل موقعیت باز', minTrades:'حداقل معامله امروز', minPremium:'حداقل پرمیوم (ریال)', deltaMin:'حداقل دلتا', deltaMax:'حداکثر دلتا', maxIvHv:'حداکثر IV/HV', rewardRisk:'هدف = چند برابر ریسک', topN:'تعداد پیشنهاد', optionStopPct:'حد ضرر آپشن (٪)', take1Pct:'هشدار نیمه‌فروش (٪)', take2Pct:'حد سود کامل (٪)', closeDaysBefore:'بستن X روز قبل سررسید', snapshotTtlDays:'نگه‌داری اسنپ‌شات (روز)' };
 const fmtN = n => n === null || n === undefined ? '-' : Math.round(n).toLocaleString();
 const fmtIv = v => v ? (v*100).toFixed(0)+'٪' : '-';
+const TRADING_LABELS = {
+    ENTRY_START: 'شروع بازه‌ی مجاز ورود (HH:MM)',
+    ENTRY_END: 'پایان بازه‌ی مجاز ورود (HH:MM)',
+    OPTION_FEE_BUY: 'کارمزد خرید آپشن (مثل 0.0012)',
+    OPTION_FEE_SELL: 'کارمزد فروش آپشن (مثل 0.0012)',
+    RISK_FREE_RATE: 'نرخ بدون ریسک سالانه (مثل 0.23)'
+};
+
+async function openTradingSettings() {
+    try {
+        const d = await apiFetch(`${BACKEND_URL}/api/trading-settings`);
+        const fields = Object.keys(d.defaults).map(k => {
+            const isTime = k === 'ENTRY_START' || k === 'ENTRY_END';
+            const v = d.values[k];
+            return `<div class="field"><label>${TRADING_LABELS[k]||k}</label><input type="${isTime?'text':'number'}" ${isTime?'':'step="any"'} id="ts_${k}" value="${v}"></div>`;
+        }).join('');
+        openModal('تنظیمات معاملات', `
+            <div class="hint">این مقادیر در دیتابیس ذخیره می‌شوند و <b>بلافاصله</b> اعمال می‌شوند. فقط فرمت HH:MM و اعداد اعشاری را رعایت کن.</div>
+            <div class="form-row">${fields}</div>
+            <button class="btn" onclick="saveTradingSettings()">ذخیره</button>
+        `);
+        window._tsKeys = Object.keys(d.defaults);
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
+async function saveTradingSettings() {
+    const body = {};
+    window._tsKeys.forEach(k => {
+        const v = document.getElementById(`ts_${k}`).value.trim();
+        if (v !== '') body[k] = v;
+    });
+    try {
+        await apiFetch(`${BACKEND_URL}/api/trading-settings`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        closeModal();
+        showAlert('تنظیمات معاملات ذخیره شد.', 'success', 3000);
+        await checkBackendStatus();
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
 
 async function openOptionSettings() {
     try {

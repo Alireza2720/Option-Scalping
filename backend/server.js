@@ -11,6 +11,7 @@ const { STRATEGIES, aggregateCandles, getRequiredCandles } = Strat;
 const Options = require('./option.js');
 const Log = require('./log.js');
 const Archive = require('./archive.js');
+const Settings = require('./settings.js');
 Log.patchConsole();
 const STARTED_AT = new Date();
 
@@ -31,9 +32,14 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const TF = Object.fromEntries(Object.entries(Strat.TIMEFRAME_MINUTES).filter(([k]) => k !== '4h'));
 const SESSION_START = 9 * 60, SESSION_END = 12 * 60 + 30;
 const toMin = s => { const [h, m] = String(s).split(':').map(Number); return h * 60 + (m || 0); };
-const ENTRY_START = toMin(process.env.ENTRY_START || '09:30');
-const ENTRY_END = toMin(process.env.ENTRY_END || '12:00');
 const fmtMin = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+let ENTRY_START = toMin(process.env.ENTRY_START || '09:30');
+let ENTRY_END = toMin(process.env.ENTRY_END || '12:00');
+async function reloadEntryWindow() {
+    const w = Settings.entryWindow();
+    ENTRY_START = w.start;
+    ENTRY_END = w.end;
+}
 
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
@@ -46,6 +52,19 @@ app.use((req, res, next) => {
     res.status(401).json({ error: 'توکن ادمین نامعتبر است' });
 });
 app.get('/api/auth/check', (req, res) => res.json({ required: !!ADMIN_TOKEN, ok: !ADMIN_TOKEN || req.headers['x-admin-token'] === ADMIN_TOKEN }));
+
+// ---------------- تنظیمات معاملات (قابل ویرایش از فرانت) ----------------
+app.get('/api/trading-settings', async (req, res, next) => {
+    try { res.json({ values: Settings.get(), defaults: Settings.DEFAULTS }); } catch (e) { next(e); }
+});
+app.put('/api/trading-settings', async (req, res, next) => {
+    try {
+        await Settings.save(req.body || {});
+        await reloadEntryWindow();
+        Options.reloadFromSettings();
+        res.json({ success: true, values: Settings.get() });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
 app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
 app.get('/strategies.js', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.sendFile(path.join(__dirname, 'strategies.js')); });
@@ -685,7 +704,12 @@ async function ensureIndexes() {
 async function start() {
     await connectDB();
     Log.init(getDB);
+    Settings.init({ getDB });
+    await Settings.load();
+    await reloadEntryWindow();
+    Options.reloadFromSettings();
     await ensureIndexes();
+    
 Options.init({ getDB, notify, TIMEFRAME_MINUTES: Strat.TIMEFRAME_MINUTES, todayDateString: () => todayDateString(getTehranParts()), archiveStats: Archive.allArchiveStats });
     await Options.ensureIndexes();
     await backfillDailyFromBase();
