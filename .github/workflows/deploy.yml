@@ -18,7 +18,7 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -e
-            cd ~/apps/Option-Scalping
+            cd ~/apps/OptionHunter
             git pull origin main
             npm install --prefix backend
             cd backend
