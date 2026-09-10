@@ -310,7 +310,19 @@ const PARAM_LABELS = {
     emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', pullbackPct:'حداکثر فاصله از EMA سریع (٪)', exitBufferPct:'بافر خروج (٪)',
     macdFast:'دوره MACD سریع', macdSlow:'دوره MACD کند', macdSignal:'دوره Signal',
     tenkanPeriod:'دوره Tenkan-sen', kijunPeriod:'دوره Kijun-sen', senkouBPeriod:'دوره Senkou Span B',
-    htfEma:'EMA تایم‌فریم بالا', htfRsiPeriod:'RSI تایم‌فریم بالا', atrPeriod:'دوره ATR', atrMult:'ضریب ATR', requireNoLowerWick:'کندل HA بدون سایه پایین (1/0)'
+    htfEma:'EMA تایم‌فریم بالا', htfRsiPeriod:'RSI تایم‌فریم بالا', atrPeriod:'دوره ATR', atrMult:'ضریب ATR', requireNoLowerWick:'کندل HA بدون سایه پایین (1/0)',
+    // ===== SMC Unicorn =====
+    swingLength:'طول پنجره سوئینگ (کندل)',
+    fvgMinGapPct:'حداقل شکاف FVG (٪)',
+    useOTE:'استفاده از فیلتر OTE (1/0)',
+    oteLow:'سطح پایین OTE (مثلاً 0.618)',
+    oteHigh:'سطح بالای OTE (مثلاً 0.786)',
+    useBreakEven:'انتقال SL به نقطه ورود بعد از TP1 (1/0)',
+    tp1R:'هدف اول (نسبت R)',
+    tp2R:'هدف دوم (نسبت R)',
+    tp3R:'هدف سوم (نسبت R)',
+    minLiquiditySweepPct:'حداقل عمق شکار نقدینگی (٪)',
+    requireVolumeFilter:'فیلتر حجم (1/0) — فعلاً غیرفعال'
 };
 const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر',
     macd:'MACD', signal:'Signal', hist:'هیستوگرام', tenkan:'Tenkan', kijun:'Kijun', spanA:'Span A', spanB:'Span B' };
