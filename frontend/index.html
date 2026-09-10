@@ -211,7 +211,7 @@
 
     <div class="card collapsible" id="cardSymbols">
         <h2 onclick="toggleCard('cardSymbols')">
-            <span class="h2-title">۱. نمادهای زیر نظر <span class="count-pill" id="symbolCountLabel">0</span> <small>عدد اول: کندل دقیقه‌ای · عدد دوم: کندل روزانه</small></span>
+            <span class="h2-title">۱. نمادهای زیر نظر <span class="count-pill" id="symbolCountLabel">0</span></span>
             <span class="chev">▼</span>
         </h2>
         <div class="card-body">
@@ -223,14 +223,14 @@
                 </div>
                 <button class="btn" onclick="addMonitoredSymbol()">افزودن</button>
             </div>
-            <div class="hint">دریافت تاریخچه‌ی روزانه از وب‌سرویس دیتای تاریخی BrsApi (سهمیه: ۱۰ درخواست در روز به‌ازای هر کلید API)</div>
+
             <div class="symbol-grid" id="symbolGrid"><div class="empty-note">نمادی اضافه نشده است</div></div>
         </div>
     </div>
 
     <div class="card collapsible" id="cardConfig">
         <h2 onclick="toggleCard('cardConfig')">
-            <span class="h2-title">۲. ایجاد تنظیم استراتژی <small>تایم‌فریم بالا جهت را تعیین می‌کند، تایم‌فریم ورود لحظه‌ی ورود را</small></span>
+            <span class="h2-title">۲. ایجاد استراتژی</span>
             <span class="chev">▼</span>
         </h2>
         <div class="card-body">
@@ -268,7 +268,7 @@
     </div>
 
     <div class="card">
-        <h2>موقعیت‌های آپشن (کاغذی) <small>ورود به بهترین عرضه، خروج به بهترین تقاضا، پس از کارمزد</small></h2>
+        <h2>موقعیت‌های اخیر آپشن</h2>
         <div class="stats-grid" id="optStats"></div>
         <div class="table-responsive"><table class="data-table">
             <thead><tr><th>پایه</th><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>ورود</th><th>قیمت ورود</th><th>قیمت فعلی/خروج</th><th>بازده</th><th>پایه ورود→فعلی</th><th>IV</th><th>دلیل خروج</th><th></th></tr></thead>
@@ -545,8 +545,28 @@ function renderStrategyCells(it) {
     if (st && !st.insufficientData && st.position === 'LONG') posBadge = '<span class="badge long">در کال</span>';
     const queue = st && st.queue === 'buy' ? ' <span class="badge warn">صف خرید</span>' : st && st.queue === 'sell' ? ' <span class="badge short">صف فروش</span>' : '';
     const active = `<input type="checkbox" ${it.enabled?'checked':''} onchange="toggleConfigEnabled('${id}', this.checked)">`;
-    const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
+    const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny outline" onclick="toggleKandelDetail('${id}')">جزئیات</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
     return `<td>${esc(name)}${queue}</td><td>${tf}</td><td>${candle}</td><td>${trend}</td><td>${posBadge}</td><td>${active}</td><td>${actions}</td>`;
+}
+function renderKandelRow(it) {
+    const st = statusMap[it._id];
+    const candleCount = st ? (st.candleCount || 0) : 0;
+    const required = st ? (st.requiredCandles || 0) : 0;
+    const htfCount = st ? (st.htfCandleCount || 0) : 0;
+    const htfRequired = st ? (st.requiredHtfCandles || 0) : 0;
+    const dataReady = st && !st.insufficientData;
+    return `<tr id="kandel-${it._id}" style="display:none;"><td colspan="7" style="background:var(--bg-input); border-left:2px solid var(--accent); padding:10px 14px;">
+        <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; font-size:12.5px;">
+            <div><b>کندل ${TF_LABELS[it.timeframe]}</b><br>${candleCount} / ${required} ${dataReady ? '<span class="badge long">آماده</span>' : '<span class="badge warn">ناکافی</span>'}</div>
+            <div><b>کندل ${TF_LABELS[it.htfTimeframe||'1d']}</b><br>${htfCount} / ${htfRequired} ${htfCount >= htfRequired ? '<span class="badge long">آماده</span>' : '<span class="badge warn">ناکافی</span>'}</div>
+            <div><b>وضعیت</b><br>${dataReady ? 'آماده‌ی ارزیابی' : 'منتظر داده'}</div>
+            <div><b>آخرین به‌روزرسانی</b><br>${st && st.updatedAt ? new Date(st.updatedAt).toLocaleTimeString('fa-IR') : '-'}</div>
+        </div>
+    </td></tr>`;
+}
+function toggleKandelDetail(id) {
+    const row = document.getElementById(`kandel-${id}`);
+    if (row) row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
 }
 function renderConfigs() {
     const tb = document.getElementById('configsBody');
@@ -558,9 +578,13 @@ function renderConfigs() {
         const items = groups[symbol];
         const insufficient = items.some(it => { const st = statusMap[it._id]; return st && st.insufficientData; });
         const insufBadge = insufficient ? '<span class="badge warn">داده ناکافی</span>' : '';
-        const symbolCell = `<td rowspan="${items.length}" class="symbol-cell"><b>${esc(symbol)}</b>${insufBadge ? '<br>' + insufBadge : ''}</td>`;
+        const symbolCell = `<td rowspan="${items.length * 2}" class="symbol-cell"><b>${esc(symbol)}</b>${insufBadge ? '<br>' + insufBadge : ''}</td>`;
         html += `<tr class="symbol-header-row">${symbolCell}${renderStrategyCells(items[0])}</tr>`;
-        for (let i = 1; i < items.length; i++) html += `<tr>${renderStrategyCells(items[i])}</tr>`;
+        html += renderKandelRow(items[0]);
+        for (let i = 1; i < items.length; i++) {
+            html += `<tr>${renderStrategyCells(items[i])}</tr>`;
+            html += renderKandelRow(items[i]);
+        }
     }
     tb.innerHTML = html;
 }
@@ -576,21 +600,22 @@ async function runOptionBacktest(id) {
     try {
         const r = await apiFetch(`${BACKEND_URL}/api/backtest-option/${id}`);
         const a = r.assumptions;
-        const head = `<div class="msg-warn" style="display:block;">کاملاً تقریبی: قرارداد فرضی ATM، سررسید فرضی ${a.assumedMaturityDays} روز، IV فرضی = ${a.ivMultiplier}×HV تاریخی، اسپرد فرضی ${a.spreadPct}٪. داده‌ی واقعی قراردادهای گذشته وجود ندارد؛ نتیجه معمولاً خوش‌بینانه‌تر از بازار واقعی است.</div>
-            <div class="stats-grid"><div class="stat"><small>تعداد معامله</small><b>${r.stats.count}</b></div><div class="stat"><small>وین‌ریت</small><b>${r.stats.winRate.toFixed(0)}٪</b></div><div class="stat"><small>بازده کل</small><b>${pct(r.stats.totalPnl)}</b></div><div class="stat"><small>میانگین</small><b>${pct(r.stats.avgPnl)}</b></div><div class="stat"><small>Profit Factor</small><b>${r.stats.profitFactor===Infinity?'∞':r.stats.profitFactor.toFixed(2)}</b></div></div>`;
+        const diag = r.diagnostic ? `<div class="msg-warn" style="display:block;background:rgba(217,83,79,.1);border-color:var(--bad);">${esc(r.diagnostic)}</div>` : '';
+        const head = diag + `<div class="msg-warn" style="display:block;">کاملاً تقریبی: قرارداد فرضی ATM، سررسید فرضی ${a.assumedMaturityDays} روز، IV فرضی = ${a.ivMultiplier}×HV تاریخی، اسپرد فرضی ${a.spreadPct}٪.</div>
+            <div class="stats-grid">
+                <div class="stat"><small>معاملات سهم پایه</small><b>${r.stockTradesCount||0}</b></div>
+                <div class="stat"><small>معاملات بسته‌شده</small><b>${r.stockClosedCount||0}</b></div>
+                <div class="stat"><small>تعداد معامله آپشن</small><b>${r.stats.count}</b></div>
+                <div class="stat"><small>وین‌ریت</small><b>${r.stats.count ? r.stats.winRate.toFixed(0)+'٪' : '-'}</b></div>
+                <div class="stat"><small>بازده کل</small><b>${r.stats.count ? pct(r.stats.totalPnl) : '-'}</b></div>
+                <div class="stat"><small>میانگین</small><b>${r.stats.count ? pct(r.stats.avgPnl) : '-'}</b></div>
+                <div class="stat"><small>Profit Factor</small><b>${r.stats.count ? (r.stats.profitFactor===Infinity?'∞':r.stats.profitFactor.toFixed(2)) : '-'}</b></div>
+            </div>`;
         const rows = r.trades.length ? r.trades.slice().reverse().map(t => `<tr><td>${fmtT(t.entryTime)}</td><td>${fmtN(t.stockEntry)}→${fmtN(t.stockExit)}</td><td>${fmtN(t.strike)}</td><td>${(t.hv*100).toFixed(0)}٪</td><td>${t.entryDelta.toFixed(2)}</td><td>${fmtN(t.optionEntry)}→${fmtN(t.optionExit)}</td><td>${pct(t.pnlPct)}</td><td style="font-size:11px;">${esc(t.exitReason||'-')}</td></tr>`).join('') : '<tr class="empty-row"><td colspan="8">معامله‌ی بسته‌شده‌ای یافت نشد</td></tr>';
         openModal(`بک‌تست آپشن (تقریبی) ${it.symbol}`, head + `<div class="table-responsive"><table class="data-table"><thead><tr><th>ورود</th><th>سهم (ورود→خروج)</th><th>اعمال فرضی</th><th>HV</th><th>دلتا ورود</th><th>پرمیوم (ورود→خروج)</th><th>بازده آپشن</th><th>دلیل خروج</th></tr></thead><tbody>${rows}</tbody></table></div>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
 
-async function loadSignalHistory() {
-    try {
-        const h = await apiFetch(`${BACKEND_URL}/api/signal-history`), tb = document.getElementById('signalHistoryBody');
-        if (!h.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">سیگنالی ثبت نشده است</td></tr>';
-        tb.innerHTML = h.map(x => `<tr><td>${fmtT(x.time)}</td><td>${esc(x.symbol)}</td><td>${esc(x.strategyName||x.strategyId)} · ${TF_LABELS[x.timeframe]||''}</td><td>${SIGNAL_LABELS[x.signalType]||x.signalType}</td><td>${x.price?x.price.toLocaleString():'-'}</td><td>${trendBadge(x.htfTrend)}</td><td style="font-size:11px;">${esc(x.reason||'-')}</td>
-            <td>${x.queue==='buy'?'<span class="badge warn">صف خرید</span>':''}${x.signalType==='BUY'&&x.inWindow===false?'<span class="badge warn">خارج بازه</span>':''}${x.incomplete?'<span class="badge warn">ناقص</span>':''}</td></tr>`).join('');
-    } catch (e) { showAlert('خطا در بارگذاری تاریخچه: ' + e.message); }
-}
 async function clearSignalHistory() {
     if (!confirm('کل تاریخچه پاک شود؟')) return;
     try { await apiFetch(`${BACKEND_URL}/api/signal-history`, { method:'DELETE' }); await loadSignalHistory(); } catch (e) { showAlert('خطا: ' + e.message); }
@@ -752,8 +777,28 @@ async function viewChain(sym) {
             } catch (e) {}
             return openModal(`زنجیره‌ی کال ${sym}`, `<div class="empty-note">قراردادی برای این نماد پیدا نشد.</div>${suggestHtml}<button class="btn small outline" style="margin-top:10px;" onclick="viewRawChain('${esc(sym)}')">API خام</button>`);
         }
-        const rows = d.rows.map(r => `<tr style="${r.reject.length?'opacity:.55':''}"><td>${esc(r.symbol)}</td><td>${fmtN(r.strike)}</td><td>${r.expiry}</td><td>${r.daysLeft}</td><td>${fmtN(r.bid)} / ${fmtN(r.ask)}</td><td>${r.spreadPct===null?'-':r.spreadPct.toFixed(1)+'٪'}</td><td>${fmtN(r.last)}</td><td>${r.oi}</td><td>${r.volume}</td><td>${r.delta.toFixed(2)}</td><td>${fmtIv(r.iv)}${r.ivHv?` <small>(${r.ivHv.toFixed(2)}×)</small>`:''}</td><td>${fmtN(r.theo)}</td><td style="font-size:11px;">${r.reject.length?esc(r.reject.join('، ')):'<span class="badge long">قابل بررسی</span>'}</td></tr>`).join('');
-        openModal(`زنجیره‌ی کال ${sym} — پایه ${fmtN(d.S)}${d.hv?` · HV ${(d.hv*100).toFixed(0)}٪`:''} · داده ${d.chainAgeSec}s پیش`, `<div style="margin-bottom:10px;"><button class="btn small outline" onclick="viewRawChain('${esc(sym)}')">API خام</button></div><div class="table-responsive"><table class="data-table"><thead><tr><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>روز</th><th>خرید / فروش</th><th>اسپرد</th><th>آخرین</th><th>OI</th><th>حجم</th><th>دلتا</th><th>IV</th><th>منصفانه</th><th>وضعیت</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+        const rows = d.rows.map(r => {
+            const ivApiShow = r.ivApi ? (r.ivApi*100).toFixed(1)+'٪' : '-';
+            const ivCalcShow = r.iv ? (r.iv*100).toFixed(1)+'٪' : '-';
+            const hvApiShow = r.hvApi ? (r.hvApi*100).toFixed(1)+'٪' : '-';
+            const bsApiShow = r.theoApi ? fmtN(r.theoApi) : '-';
+            const bsCalcShow = r.theo ? fmtN(r.theo) : '-';
+            const deltaShow = r.deltaApi ? r.deltaApi.toFixed(2) : (r.delta ? r.delta.toFixed(2) : '-');
+            const gammaShow = r.gammaApi ? r.gammaApi.toFixed(4) : (r.gamma ? r.gamma.toFixed(4) : '-');
+            const thetaShow = r.thetaApi ? r.thetaApi.toFixed(1) : (r.thetaDay ? r.thetaDay.toFixed(1) : '-');
+            const vegaShow = r.vegaApi ? r.vegaApi.toFixed(1) : (r.vega ? r.vega.toFixed(1) : '-');
+            return `<tr style="${r.reject.length?'opacity:.55':''}">
+                <td>${esc(r.symbol)}</td><td>${fmtN(r.strike)}</td><td>${r.expiry}</td><td>${r.daysLeft}</td>
+                <td>${fmtN(r.bid)} / ${fmtN(r.ask)}</td><td>${r.spreadPct===null?'-':r.spreadPct.toFixed(1)+'٪'}</td>
+                <td>${ivApiShow}<br><small>محاسبه: ${ivCalcShow}</small></td>
+                <td>${hvApiShow}</td>
+                <td>${bsApiShow}<br><small>محاسبه: ${bsCalcShow}</small></td>
+                <td>${deltaShow}</td><td>${gammaShow}</td><td>${thetaShow}</td><td>${vegaShow}</td>
+                <td style="font-size:11px;">${r.reject.length?esc(r.reject.join('، ')):'<span class="badge long">قابل بررسی</span>'}</td>
+            </tr>`;
+        }).join('');
+        openModal(`زنجیره‌ی کال ${sym} — پایه ${fmtN(d.S)}${d.hv?` · HV محاسبه‌شده ${(d.hv*100).toFixed(0)}٪`:''} · داده ${d.chainAgeSec}s پیش`,
+            `<div style="margin-bottom:10px;"><button class="btn small outline" onclick="viewRawChain('${esc(sym)}')">API خام</button></div><div class="table-responsive"><table class="data-table"><thead><tr><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>روز</th><th>خرید / فروش</th><th>اسپرد</th><th>IV (API / محاسبه)</th><th>HV (API)</th><th>BS (API / محاسبه)</th><th>دلتا</th><th>گاما</th><th>تتا</th><th>وگا</th><th>وضعیت</th></tr></thead><tbody>${rows}</tbody></table></div>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
 async function viewRawChain(sym) {

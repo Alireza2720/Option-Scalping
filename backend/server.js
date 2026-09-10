@@ -486,8 +486,9 @@ app.get('/api/backtest-option/:configId', async (req, res, next) => {
         const cfg = await getDB().collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
         if (!cfg) return res.status(404).json({ error: 'تنظیم یافت نشد' });
         const { trades } = await computeStockBacktestTrades(cfg);
-        const result = await Options.runApproxOptionBacktest(cfg.symbol, trades.filter(t => t.status === 'closed'));
-        res.json({ stockTradesCount: trades.length, ...result });
+        const closedTrades = trades.filter(t => t.status === 'closed');
+        const result = await Options.runApproxOptionBacktest(cfg.symbol, closedTrades);
+        res.json({ stockTradesCount: trades.length, stockClosedCount: closedTrades.length, ...result });
     } catch (e) { next(e); }
 });
 

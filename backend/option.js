@@ -8,7 +8,6 @@ function init(d) { deps = d; }
 const OPTIONS_URL = process.env.OPTIONS_API_URL || 'https://s3.optionschool24.com/last?type=3';
 const TRADING_DAYS = 245;
 
-// این‌ها پویا هستند و از Settings خوانده می‌شوند تا از فرانت قابل تغییر باشند
 let RISK_FREE = +(process.env.RISK_FREE_RATE || 0.23);
 let FEE_BUY = +(process.env.OPTION_FEE_BUY || 0.0012);
 let FEE_SELL = +(process.env.OPTION_FEE_SELL || 0.0012);
@@ -44,6 +43,14 @@ const norm = s => String(s || '').replace(/ي/g, 'ی').replace(/ك/g, 'ک').repl
 const num = v => { const n = parseFloat(String(v ?? '').replace(/,/g, '')); return Number.isFinite(n) ? n : 0; };
 const first = s => num(String(s || '').split('/')[0]);
 
+// تبدیل درصد به اعشار: اگر عدد بزرگ‌تر از ۳ باشد، درصد است (مثل ۲۵ → ۰.۲۵)
+// اگر کوچک‌تر باشد، از قبل اعشار است (مثل ۰.۲۵)
+const asDecimal = v => {
+    const n = num(v);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n > 3 ? n / 100 : n;
+};
+
 function parseContract(r) {
     const fname = r.fname || '';
     const isPut = /^اخت[يی]ارف/.test(fname), isCallName = /^اخت[يی]ارخ/.test(fname);
@@ -54,7 +61,13 @@ function parseContract(r) {
         last: num(r.close), final: num(r.final), yday: num(r.yday),
         bid: first(r.b_price), bidVol: first(r.b_volume), ask: first(r.s_price), askVol: first(r.s_volume),
         volume: num(r.Tvolume), value: num(r.Tvalue), trades: num(r.Tcount), oi: num(r.op), oiChange: num(r.op_change),
-        bsApi: num(r.black_sholes), ivApi: num(r.imp), hvApi: num(r.sigma), deltaApi: num(r.delta),
+        bsApi: num(r.black_sholes),
+        ivApi: asDecimal(r.imp),
+        hvApi: asDecimal(r.sigma),
+        deltaApi: num(r.delta),
+        gammaApi: num(r.gamma),
+        thetaApi: num(r.theta),
+        vegaApi: num(r.vega),
         size: num(r.size) || 1000, margin: num(r.tazmin), intrinsic: num(r.value), statusText: r.status_text || ''
     };
 }
@@ -104,13 +117,39 @@ const chainAge = () => chainCache.at ? Math.round((Date.now() - chainCache.at) /
 
 // ---------------- متریک‌های یک قرارداد ----------------
 function metrics(c, S, hv) {
-    const T = Math.max(c.daysLeft, 0.5) / 365, mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0;
+    const T = Math.max(c.daysLeft, 0.5) / 365;
+    const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0;
     const spreadPct = mid > 0 ? (c.ask - c.bid) / mid * 100 : null;
+
+    // اولویت: HV ورودی، بعد HV از API، در نهایت 0.4
     const vol = hv || c.hvApi || 0.4;
+
     const theo = bsCall(S, c.strike, T, RISK_FREE, vol);
-    const iv = impliedVol(c.ask > 0 ? c.ask : c.last, S, c.strike, T, RISK_FREE);
-    return { T, mid, spreadPct, hv: vol, theo: theo.price, delta: theo.delta, thetaDay: theo.thetaDay, iv, ivHv: iv ? iv / vol : null,
-        leverage: c.ask > 0 ? theo.delta * S / c.ask : null, moneynessPct: (S / c.strike - 1) * 100 };
+
+    // اولویت: IV از API، در غیر این صورت از قیمت بازار استخراج
+    let iv = c.ivApi;
+    if (!iv || iv <= 0) {
+        iv = impliedVol(c.ask > 0 ? c.ask : c.last, S, c.strike, T, RISK_FREE);
+    }
+
+    return {
+        T, mid, spreadPct, hv: vol,
+        theo: theo.price,
+        theoApi: c.bsApi || null,
+        delta: theo.delta,
+        deltaApi: c.deltaApi || null,
+        gamma: theo.gamma,
+        gammaApi: c.gammaApi || null,
+        thetaDay: theo.thetaDay,
+        thetaApi: c.thetaApi || null,
+        vega: theo.vega,
+        vegaApi: c.vegaApi || null,
+        iv,
+        ivApi: c.ivApi || null,
+        ivHv: iv ? iv / vol : null,
+        leverage: c.ask > 0 ? theo.delta * S / c.ask : null,
+        moneynessPct: (S / c.strike - 1) * 100
+    };
 }
 
 // ---------------- انتخاب قرارداد ----------------
@@ -266,7 +305,6 @@ async function storeEOD(chain, monitoredSet) {
 async function ensureIndexes() {
     const db = deps.getDB();
     await db.collection('option_snapshots').createIndex({ symbol: 1, time: 1 });
-    // بدون TTL — داده‌ی قدیمی به‌جای حذف، توسط archive.js منتقل می‌شود (آستانه‌ی زمانی از snapshotTtlDays خوانده می‌شود)
     try { await db.collection('option_snapshots').dropIndex('time_1'); } catch (e) {}
     await db.collection('option_snapshots').createIndex({ time: 1 });
     await db.collection('option_daily').createIndex({ symbol: 1, date: 1 }, { unique: true });
@@ -278,8 +316,7 @@ async function storageStats() {
     const names = ['candles_base', 'candles_daily', 'candles_tf', 'option_snapshots', 'option_daily', 'option_positions', 'signal_history', 'trades', 'telegram_outbox', 'logs'];
     const cols = [];
     for (const n of names) { try { const c = await db.command({ collStats: n }); cols.push({ name: n, count: c.count, sizeMB: +(c.size / 1048576).toFixed(2), storageMB: +((c.storageSize + c.totalIndexSize) / 1048576).toFixed(2) }); } catch (e) {} }
-    const archive = deps.archiveStats ? await deps.archiveStats() : [];
-    return { dataMB: +(st.dataSize / 1048576).toFixed(1), storageMB: +((st.storageSize + st.indexSize) / 1048576).toFixed(1), limitMB: 512, cols, archive };
+    return { dataMB: +(st.dataSize / 1048576).toFixed(1), storageMB: +((st.storageSize + st.indexSize) / 1048576).toFixed(1), cols };
 }
 function positionStats(list) {
     const closed = list.filter(p => p.status === 'closed' && typeof p.pnlPct === 'number'), wins = closed.filter(p => p.pnlPct > 0);
@@ -287,7 +324,8 @@ function positionStats(list) {
     return { open: list.length - closed.length, closed: closed.length, winRate: closed.length ? wins.length / closed.length * 100 : 0, avgPnl: closed.length ? sum(closed) / closed.length : 0,
         totalPnl: sum(closed), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0), avgWin: wins.length ? gp / wins.length : 0, avgLoss: closed.length - wins.length ? -gl / (closed.length - wins.length) : 0 };
 }
-// ---------------- بک‌تست تقریبی آپشن (بلک‌شولز فرضی؛ داده‌ی واقعی قرارداد گذشته وجود ندارد) ----------------
+
+// ---------------- بک‌تست تقریبی آپشن ----------------
 const OPT_BT_DEFAULTS = { assumedMaturityDays: 45, ivMultiplier: 1.2, spreadPct: 5 };
 function historicalHV(closes, uptoIndex, n = 20) {
     const start = Math.max(0, uptoIndex - n), slice = closes.slice(start, uptoIndex + 1);
@@ -300,6 +338,24 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     const p = { ...OPT_BT_DEFAULTS, ...opts };
     const daily = await deps.getDB().collection('candles_daily').find({ symbol }).sort({ time: 1 }).toArray();
     const closes = daily.map(r => r.close), times = daily.map(r => Math.floor(new Date(r.time).getTime() / 1000));
+
+    if (!daily.length) {
+        return {
+            assumptions: p,
+            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: 0 },
+            trades: [],
+            diagnostic: `کندل روزانه برای ${symbol} وجود ندارد. ابتدا از دکمه‌ی «تاریخچه» در بخش نمادهای زیر نظر استفاده کنید.`
+        };
+    }
+    if (!closedTrades.length) {
+        return {
+            assumptions: p,
+            stats: { count: 0, winRate: 0, avgPnl: 0, totalPnl: 0, profitFactor: 0 },
+            trades: [],
+            diagnostic: 'استراتژی سهم پایه هیچ معامله‌ی بسته‌شده‌ای تولید نکرده است. تنظیمات استراتژی را بررسی کنید یا داده‌ی بیشتری جمع کنید.'
+        };
+    }
+
     const trades = [];
     for (const t of closedTrades) {
         let idx = -1; for (let i = 0; i < times.length; i++) { if (times[i] <= t.entryTime) idx = i; else break; }
@@ -316,14 +372,17 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     }
     const wins = trades.filter(x => x.pnlPct > 0), sum = a => a.reduce((s, x) => s + x.pnlPct, 0);
     const gp = sum(wins), gl = -sum(trades.filter(x => x.pnlPct <= 0));
-    return { assumptions: p, stats: { count: trades.length, winRate: trades.length ? wins.length / trades.length * 100 : 0, avgPnl: trades.length ? sum(trades) / trades.length : 0,
+    const result = { assumptions: p, stats: { count: trades.length, winRate: trades.length ? wins.length / trades.length * 100 : 0, avgPnl: trades.length ? sum(trades) / trades.length : 0,
         totalPnl: sum(trades), profitFactor: gl > 0 ? gp / gl : (gp > 0 ? Infinity : 0) }, trades };
+    if (!trades.length) result.diagnostic = 'هیچ معامله‌ای در بک‌تست تولید نشد (احتمالاً قیمت‌های ورود و خروج یکسان بوده یا داده‌ی کافی نیست).';
+    return result;
 }
 
 // ---------------- روت‌ها ----------------
 function registerRoutes(app, ObjectId) {
     app.get('/api/options/settings', async (req, res, next) => { try { res.json({ values: await getSettings(), defaults: DEFAULT_SETTINGS, fees: { buy: FEE_BUY, sell: FEE_SELL }, riskFree: RISK_FREE }); } catch (e) { next(e); } });
     app.put('/api/options/settings', async (req, res, next) => { try { res.json(await saveSettings(req.body || {})); } catch (e) { next(e); } });
+
     app.get('/api/options/chain/:underlying', async (req, res, next) => {
         try {
             const s = await getSettings(), chain = await fetchChain(60000);
@@ -338,7 +397,7 @@ function registerRoutes(app, ObjectId) {
             res.json({ underlying: req.params.underlying, matchedNames: names, S: rows[0] ? rows[0].S : null, hv, chainAgeSec: chainAge(), rows });
         } catch (e) { next(e); }
     });
-    // ابزار عیب‌یابی: لیست همه‌ی نام‌های دارایی پایه‌ای که الان در بازار آپشن وجود دارند
+
     app.get('/api/options/underlyings', async (req, res, next) => {
         try {
             const chain = await fetchChain(60000), map = new Map();
@@ -346,6 +405,7 @@ function registerRoutes(app, ObjectId) {
             res.json({ count: map.size, underlyings: Array.from(map.entries()).map(([underlying, contracts]) => ({ underlying, contracts })).sort((a, b) => a.underlying.localeCompare(b.underlying)) });
         } catch (e) { next(e); }
     });
+
     app.get('/api/options/recommend/:configId', async (req, res, next) => {
         try {
             const db = deps.getDB(), cfg = await db.collection('strategy_configs').findOne({ _id: new ObjectId(req.params.configId) });
@@ -355,6 +415,7 @@ function registerRoutes(app, ObjectId) {
             res.json(await recommendForState(cfg, st));
         } catch (e) { next(e); }
     });
+
     app.get('/api/options/positions', async (req, res, next) => {
         try { const list = await deps.getDB().collection('option_positions').find({}).sort({ entryTime: -1 }).limit(300).toArray(); res.json({ positions: list, stats: positionStats(list) }); } catch (e) { next(e); }
     });
