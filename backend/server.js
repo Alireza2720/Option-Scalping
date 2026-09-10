@@ -187,7 +187,6 @@ async function sendDailySummary() {
     const today = todayDateString(getTehranParts());
     const st = await getDB().collection('meta').findOne({ _id: `daystats_${today}` }) || {};
     const usage = await getAllUsage();
-    const openTrades = await getDB().collection('trades').countDocuments({ status: 'open' });
     let optLine = '', storLine = '';
     try { const list = await getDB().collection('option_positions').find({}).toArray(); const s = Options.positionStats(list); optLine = `\nآپشن: باز ${s.open} | بسته ${s.closed} | وین‌ریت ${s.winRate.toFixed(0)}٪ | بازده کل ${s.totalPnl.toFixed(0)}٪`; } catch (e) {}
     try {
@@ -195,7 +194,7 @@ async function sendDailySummary() {
         const archLine = sg.archive && sg.archive.length ? ' | آرشیو: ' + sg.archive.map(a => a.mb !== null ? `${a.mb}MB` : 'خطا').join('، ') : '';
         storLine = `\nدیتابیس اصلی: ${sg.storageMB}/${sg.limitMB} MB${sg.storageMB > 400 ? ' ⚠️ نزدیک به سقف' : ''}${archLine}`;
     } catch (e) {}
-    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}\nموقعیت‌های باز سهم: ${openTrades}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
+    await notify(`📊 خلاصه‌ی روز ${today}\nتیک موفق: ${st.ticksOk || 0} | ناموفق: ${st.ticksFail || 0}\nسیگنال‌ها: ${st.signals || 0} | لغوشده: ${st.cancels || 0}${optLine}\nمصرف API: ${usage.total}/${usage.totalLimit}${storLine}`);
 }
 
 // ---------------- بکاپ هفتگی تنظیمات (Atlas رایگان بکاپ خودکار ندارد) ----------------
