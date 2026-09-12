@@ -469,7 +469,7 @@ app.post('/api/strategy-configs', async (req, res, next) => {
         const doc = { symbol, strategyId, timeframe, htfTimeframe: htf, candleType: candleType === 'simple' ? 'simple' : 'heikin', params: { ...STRATEGIES[strategyId].defaultParams, ...(params || {}) }, enabled: enabled !== false, createdAt: new Date() };
         const r = await db.collection('strategy_configs').insertOne(doc);
         const fullDoc = { _id: r.insertedId, ...doc };
-        // ✅ ارزیابی فوری استراتژی جدید تا وضعیتش در جدول «لیست پایش فعال» بلافاصله دیده شود
+        if (strategyId === 'ensemble') console.log('ℹ️ استراتژی Ensemble — محاسبات سنگین‌تر');
         await evaluateStrategyConfig(fullDoc, null).catch(e => console.error('❌ ارزیابی آنی استراتژی جدید:', e.message));
         res.json(fullDoc);
     } catch (e) { next(e); }
@@ -518,7 +518,77 @@ app.get('/api/backtest-option/:configId', async (req, res, next) => {
         res.json({ stockTradesCount: trades.length, stockClosedCount: closedTrades.length, ...result });
     } catch (e) { next(e); }
 });
+// ✅ بک‌تست مقایسه‌ای همه استراتژی‌ها روی نمادهای انتخابی
+app.post('/api/backtest-compare', async (req, res, next) => {
+    try {
+        const { symbols, strategyIds, timeframe, htfTimeframe, candleType, params, useRealOption } = req.body || {};
+        if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: 'حداقل یک نماد انتخاب کنید' });
+        if (!Array.isArray(strategyIds) || !strategyIds.length) return res.status(400).json({ error: 'حداقل یک استراتژی انتخاب کنید' });
 
+        const tf = timeframe || '30m';
+        const htf = htfTimeframe || '1d';
+        const results = [];
+
+        for (const symbol of symbols) {
+            for (const sid of strategyIds) {
+                if (!STRATEGIES[sid]) continue;
+                const cfg = {
+                    symbol, strategyId: sid, timeframe: tf, htfTimeframe: htf,
+                    candleType: candleType || 'heikin',
+                    params: { ...STRATEGIES[sid].defaultParams, ...(params || {}) }
+                };
+                try {
+                    const { trades } = await computeStockBacktestTrades(cfg);
+                    const closedTrades = trades.filter(t => t.status === 'closed');
+                    const stockWins = closedTrades.filter(t => t.pnlPct > 0);
+                    const stockSum = closedTrades.reduce((s, t) => s + t.pnlPct, 0);
+
+                    let optStats;
+                    let optMode = 'approximate';
+                    if (useRealOption) {
+                        const real = await Options.runRealOptionBacktest(symbol, closedTrades);
+                        if (real.available) {
+                            optStats = real.stats;
+                            optMode = 'real';
+                        } else {
+                            const approx = await Options.runApproxOptionBacktest(symbol, closedTrades);
+                            optStats = approx.stats;
+                            optMode = 'approximate (fallback)';
+                        }
+                    } else {
+                        const approx = await Options.runApproxOptionBacktest(symbol, closedTrades);
+                        optStats = approx.stats;
+                    }
+
+                    results.push({
+                        symbol, strategyId: sid,
+                        strategyName: STRATEGIES[sid].name,
+                        stock: {
+                            total: trades.length,
+                            closed: closedTrades.length,
+                            winRate: closedTrades.length ? stockWins.length / closedTrades.length * 100 : 0,
+                            avgPnl: closedTrades.length ? stockSum / closedTrades.length : 0,
+                            totalPnl: stockSum
+                        },
+                        option: optStats,
+                        optionMode: optMode
+                    });
+                } catch (e) {
+                    results.push({ symbol, strategyId: sid, strategyName: STRATEGIES[sid]?.name || sid, error: e.message });
+                }
+            }
+        }
+
+        // مرتب‌سازی بر اساس profitFactor آپشن
+        results.sort((a, b) => {
+            const pfA = a.option && a.option.profitFactor !== null && a.option.profitFactor !== undefined ? a.option.profitFactor : -1;
+            const pfB = b.option && b.option.profitFactor !== null && b.option.profitFactor !== undefined ? b.option.profitFactor : -1;
+            return pfB - pfA;
+        });
+
+        res.json({ count: results.length, results });
+    } catch (e) { next(e); }
+});
 // ---------------- ارزیابی استراتژی ----------------
 async function evaluateStrategyConfig(config, marketInfo) {
     const def = STRATEGIES[config.strategyId]; if (!def) return;
@@ -647,7 +717,11 @@ async function tick() {
             if (tehran.minute % 5 === 0 || openOpt > 0) {
                 const chain = await Options.fetchChain(30000);
                 const mset = new Set(monitored.map(m => Options.norm(m.symbol)));
-                if (tehran.minute % 5 === 0) await Options.storeSnapshots(chain, mset);
+                if (tehran.minute % 5 === 0) {
+                    await Options.storeSnapshots(chain, mset);
+                    // ✅ ذخیره دیتای کامل آپشن برای بک‌تست دقیق (هر ۵ دقیقه)
+                    await Options.storeFullOptionHistory(chain, mset);
+                }
                 await Options.managePositions(chain);
             }
         } catch (e) { console.error('❌ آپشن:', e.message); }

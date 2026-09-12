@@ -848,7 +848,134 @@
         }
         return { ha, signals, trades, htfTrend: lastTrend };
     }
+    // ==========================================================
+    // استراتژی ۸: Ensemble (رأی‌گیری وزنی از ۷ استراتژی)
+    // منطق: هر استراتژی یه وزن بر اساس PF×WinRate داره
+    // وقتی مجموع وزن BUY از آستانه بگذره + حداقل N استراتژی موافق، بخر
+    // ==========================================================
+    const ENSEMBLE_DEFAULTS = {
+        threshold: 1.5,
+        minAgree: 2,
+        wRsi: 0.70,
+        wEma: 0.88,
+        wMacd: 0.59,
+        wIchimoku: 0.75,
+        wSmc: 1.38,
+        wSilver: 1.05,
+        wOb: 0.52,
+        cooldownBars: 3,
+        maxHoldBars: 30,
+        atrPeriod: 14,
+        atrMult: 2.0,
+        htfEma: 20,
+        htfRsiPeriod: 14
+    };
 
+    function runEnsemble(candles, params, ctx) {
+        const p = { ...ENSEMBLE_DEFAULTS, ...(params || {}) };
+        const subStrategies = [
+            { id: 'rsi50_2', weight: p.wRsi, run: runRSIPullback, defaults: RSI_DEFAULTS },
+            { id: 'ema_heikin', weight: p.wEma, run: runEMAPullback, defaults: EMA_DEFAULTS },
+            { id: 'macd_momentum', weight: p.wMacd, run: runMACDMomentum, defaults: MACD_DEFAULTS },
+            { id: 'ichimoku_cloud', weight: p.wIchimoku, run: runIchimoku, defaults: ICHIMOKU_DEFAULTS },
+            { id: 'smc_unicorn', weight: p.wSmc, run: runSMCUnicorn, defaults: SMC_DEFAULTS },
+            { id: 'silver_bullet', weight: p.wSilver, run: runSilverBullet, defaults: SB_DEFAULTS },
+            { id: 'ob_sweep', weight: p.wOb, run: runOBSweep, defaults: OB_DEFAULTS }
+        ];
+
+        const subCtx = { ...ctx, entryWindow: ctx && ctx.entryWindow };
+        const results = {};
+        for (const sub of subStrategies) {
+            try {
+                const subParams = {
+                    ...sub.defaults,
+                    candleType: p.candleType,
+                    htfEma: p.htfEma,
+                    htfRsiPeriod: p.htfRsiPeriod
+                };
+                results[sub.id] = sub.run(candles, subParams, subCtx);
+            } catch (e) {
+                results[sub.id] = { signals: [], trades: [], htfTrend: null, ha: [] };
+            }
+        }
+
+        const n = candles.length;
+        const atr = calculateATR(candles, p.atrPeriod);
+        const firstHa = results.rsi50_2.ha && results.rsi50_2.ha.length ? results.rsi50_2.ha : getDisplayCandles(candles, p.candleType || 'heikin');
+        const signals = [];
+        const trades = [];
+        let position = null, entry = null, cooldown = 0, lastTrend = null;
+
+        for (let i = 0; i < n; i++) {
+            const c = candles[i];
+            let buyWeight = 0, buyCount = 0, exitWeight = 0, exitCount = 0;
+            const voters = [];
+
+            for (const sub of subStrategies) {
+                const subSigs = results[sub.id].signals;
+                if (!subSigs || !subSigs[i]) continue;
+                const s = subSigs[i];
+                if (s.signalType === 'BUY') {
+                    buyWeight += sub.weight;
+                    buyCount++;
+                    voters.push(`${sub.id}(${sub.weight.toFixed(2)})`);
+                } else if (s.signalType === 'EXIT_LONG') {
+                    exitWeight += sub.weight;
+                    exitCount++;
+                }
+            }
+
+            for (const sub of subStrategies) {
+                if (results[sub.id].htfTrend) { lastTrend = results[sub.id].htfTrend; break; }
+            }
+
+            const ind = {
+                stop: entry ? round(entry.stop) : null,
+                buyWeight: round(buyWeight),
+                exitWeight: round(exitWeight)
+            };
+            let signalType = null, reason = null;
+
+            if (position === 'LONG') {
+                const bars = i - entry.idx;
+                if (exitWeight >= p.threshold && exitCount >= p.minAgree) {
+                    reason = `Ensemble EXIT: ${exitCount} استراتژی موافق (وزن ${exitWeight.toFixed(2)})`;
+                } else if (c.close < entry.stop) {
+                    reason = `شکست حد ضرر (${Math.round(entry.stop).toLocaleString()})`;
+                } else if (bars >= p.maxHoldBars) {
+                    reason = `سقف زمانی ${p.maxHoldBars} کندل`;
+                }
+                if (reason) {
+                    position = null; signalType = 'EXIT_LONG';
+                    const tr = trades[trades.length - 1];
+                    if (tr) {
+                        tr.exitDate = c.time;
+                        tr.exitPrice = c.close;
+                        tr.pnlPct = (c.close / tr.entryPrice - 1) * 100;
+                        tr.exitReason = reason;
+                    }
+                    entry = null; cooldown = p.cooldownBars;
+                }
+            } else {
+                if (cooldown > 0) cooldown--;
+                else if (buyWeight >= p.threshold && buyCount >= p.minAgree && atr[i] !== null) {
+                    position = 'LONG'; signalType = 'BUY';
+                    const stopPrice = c.close - p.atrMult * atr[i];
+                    entry = { idx: i, price: c.close, stop: stopPrice };
+                    ind.stop = round(stopPrice);
+                    reason = `Ensemble BUY: ${buyCount} استراتژی (وزن ${buyWeight.toFixed(2)}) | ${voters.join(', ')}`;
+                    trades.push({
+                        type: 'خرید', entryDate: c.time, entryPrice: c.close, stop: stopPrice,
+                        reason, buyWeight, buyCount
+                    });
+                }
+            }
+
+            signals.push({ time: c.time, indicators: ind, signalType, position, reason });
+        }
+
+        return { ha: firstHa, signals, trades, htfTrend: lastTrend };
+    }
     // ---------------- تعریف استراتژی‌ها ----------------
     const STRATEGIES = {
         rsi50_2: {
@@ -892,6 +1019,12 @@
             defaultParams: OB_DEFAULTS,
             indicators: { overlay: ['stop'], panel: [] },
             run: runOBSweep
+        },
+        ensemble: {
+            id: 'ensemble', name: 'Ensemble (ترکیبی)', defaultTimeframe: '30m', htfTimeframe: '1d',
+            defaultParams: ENSEMBLE_DEFAULTS,
+            indicators: { overlay: ['stop'], panel: [] },
+            run: runEnsemble
         }
     };
 
@@ -904,6 +1037,7 @@
         if (id === 'smc_unicorn') return Math.max(p.swingLength + 5, p.atrPeriod + 3, p.maxHoldBars);
         if (id === 'silver_bullet') return Math.max(p.atrPeriod + 5, 10);
         if (id === 'ob_sweep') return Math.max(p.swingLength + p.obLookback + 5, p.atrPeriod + 3, p.maxHoldBars);
+        if (id === 'ensemble') return 100; // چون همه‌ی زیراستراتژی‌ها رو اجرا می‌کنه، بیشترین نیاز رو داره
         return 10;
     }
     function getRequiredHtfCandles(id, params) {
@@ -916,9 +1050,9 @@
         calculateRSI, calculateEMA, calculateATR, calculateMACD, calculateIchimoku,
         aggregateCandles, TIMEFRAME_MINUTES, getRequiredCandles, getRequiredHtfCandles,
         runRSIPullback, runEMAPullback, runMACDMomentum, runIchimoku,
-        runSMCUnicorn, runSilverBullet, runOBSweep,
+        runSMCUnicorn, runSilverBullet, runOBSweep, runEnsemble,
         RSI_DEFAULTS, EMA_DEFAULTS, MACD_DEFAULTS, ICHIMOKU_DEFAULTS,
-        SMC_DEFAULTS, SB_DEFAULTS, OB_DEFAULTS,
+        SMC_DEFAULTS, SB_DEFAULTS, OB_DEFAULTS, ENSEMBLE_DEFAULTS,
         STRATEGIES
     };
 });

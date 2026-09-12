@@ -1,4 +1,4 @@
-// ======================== option.js (کامل و نهایی v2) ========================
+// ======================== option.js (کامل و نهایی v3) ========================
 'use strict';
 const fetch = require('node-fetch');
 const Settings = require('./settings.js');
@@ -201,45 +201,110 @@ function calcPositionSize(pick, scenario, settings) {
 }
 
 // ---------------- انتخاب قرارداد ----------------
+const RELAX_LEVELS = [
+    { name: 'A+', tag: null,       overrides: {} },
+    { name: 'A',  tag: null,       overrides: { minOI: 200, minTrades: 2, maxSpreadPct: 15, deltaMin: 0.30, deltaMax: 0.90 } },
+    { name: 'B',  tag: '⚠️ کیفیت B', overrides: { minOI: 50,  minTrades: 1, maxSpreadPct: 20, deltaMin: 0.25, deltaMax: 0.92, maxIvHv: 1.8 } },
+    { name: 'C',  tag: '🚨 کیفیت پایین — ریسک بالا', overrides: { minOI: 0, minTrades: 0, maxSpreadPct: 30, deltaMin: 0.20, deltaMax: 0.95, maxIvHv: 2.5, minPremium: 100 } }
+];
+
+function scoreContract(c, sc, s, effective) {
+    const S = sc.S || c.S, m = metrics(c, S, sc.hv);
+    const R = rejectReasons(c, m, effective);
+    if (R.length) return { ok: false, reasons: R, m };
+    const h = Math.min(sc.horizonDays, Math.max(c.daysLeft - 1, 1));
+    const T2 = Math.max((c.daysLeft - h) / 365, 1 / 365);
+    const sig = m.iv || m.hv, cost = c.ask * (1 + FEE_BUY), half = (c.ask - c.bid) / 2;
+    const exitAdj = v => Math.max(v - half, 0) * (1 - FEE_SELL);
+    const pt = exitAdj(bsCall(sc.target, c.strike, T2, RISK_FREE, sig).price) - cost;
+    const pl = exitAdj(bsCall(sc.stop, c.strike, T2, RISK_FREE, sig).price) - cost;
+    const pf = exitAdj(bsCall(S, c.strike, T2, RISK_FREE, sig).price) - cost;
+    const rr = pl < 0 ? pt / -pl : (pt > 0 ? 99 : 0);
+    const liq = Math.pow(Math.min(1, c.oi / 1000), 0.25) * (1 - (m.spreadPct / effective.maxSpreadPct) * 0.4);
+    const ivPen = m.ivHv ? Math.max(0.6, Math.min(1, 1.3 / m.ivHv)) : 1;
+    const pick = {
+        symbol: c.symbol, fullName: c.fullName, strike: c.strike, expiry: c.expiry,
+        daysLeft: c.daysLeft, ask: c.ask, bid: c.bid, oi: c.oi, volume: c.volume, size: c.size,
+        spreadPct: m.spreadPct, theo: m.theo, iv: m.iv, hv: m.hv, ivHv: m.ivHv,
+        delta: m.delta, thetaDay: m.thetaDay, leverage: m.leverage,
+        profitPct: pt / cost * 100, lossPct: pl / cost * 100, flatPct: pf / cost * 100, rr,
+        bePct: breakevenMove(S, c.strike, T2, sig, cost, half),
+        score: rr * liq * ivPen, S
+    };
+    pick.positionSize = calcPositionSize(pick, sc, s);
+    return { ok: true, pick, m };
+}
+
+function rejectionScore(c, m, R, effective) {
+    let score = 0;
+    if (R.includes('OI کم')) score += Math.max(0, (effective.minOI - c.oi) / Math.max(effective.minOI, 1)) * 100;
+    if (R.includes('بدون معامله امروز')) score += Math.max(0, (effective.minTrades - c.trades) / Math.max(effective.minTrades, 1)) * 100;
+    if (R.includes('اسپرد بالا')) score += Math.max(0, (m.spreadPct - effective.maxSpreadPct)) * 5;
+    if (R.includes('دلتا پایین')) score += Math.max(0, (effective.deltaMin - m.delta)) * 500;
+    if (R.includes('دلتا بالا')) score += Math.max(0, (m.delta - effective.deltaMax)) * 500;
+    if (R.includes('IV گران')) score += Math.max(0, (m.ivHv - effective.maxIvHv)) * 100;
+    if (R.includes('سررسید نزدیک')) score += Math.max(0, (effective.minDays - c.daysLeft)) * 5;
+    if (R.includes('سررسید دور')) score += Math.max(0, (c.daysLeft - effective.maxDays)) * 5;
+    return score;
+}
+
 function selectCalls(chain, underlying, sc, s) {
     const names = Array.isArray(underlying) ? underlying : [underlying];
     const cands = chain.filter(c => c.isCall && names.includes(c.underlying));
-    const rejected = {}, scored = [];
-    for (const c of cands) {
-        const S = sc.S || c.S, m = metrics(c, S, sc.hv);
-        const R = rejectReasons(c, m, s);
-        if (R.length) { R.forEach(x => rejected[x] = (rejected[x] || 0) + 1); continue; }
-        const h = Math.min(sc.horizonDays, Math.max(c.daysLeft - 1, 1));
-        const T2 = Math.max((c.daysLeft - h) / 365, 1 / 365);
-        const sig = m.iv || m.hv, cost = c.ask * (1 + FEE_BUY), half = (c.ask - c.bid) / 2;
-        const exitAdj = v => Math.max(v - half, 0) * (1 - FEE_SELL);
-        const pt = exitAdj(bsCall(sc.target, c.strike, T2, RISK_FREE, sig).price) - cost;
-        const pl = exitAdj(bsCall(sc.stop, c.strike, T2, RISK_FREE, sig).price) - cost;
-        const pf = exitAdj(bsCall(S, c.strike, T2, RISK_FREE, sig).price) - cost;
-        const rr = pl < 0 ? pt / -pl : (pt > 0 ? 99 : 0);
-        const liq = Math.pow(Math.min(1, c.oi / 1000), 0.25) * (1 - (m.spreadPct / s.maxSpreadPct) * 0.4);
-        const ivPen = m.ivHv ? Math.max(0.6, Math.min(1, 1.3 / m.ivHv)) : 1;
-        const pick = {
-            symbol: c.symbol, fullName: c.fullName, strike: c.strike, expiry: c.expiry,
-            daysLeft: c.daysLeft, ask: c.ask, bid: c.bid, oi: c.oi, volume: c.volume, size: c.size,
-            spreadPct: m.spreadPct, theo: m.theo, iv: m.iv, hv: m.hv, ivHv: m.ivHv,
-            delta: m.delta, thetaDay: m.thetaDay, leverage: m.leverage,
-            profitPct: pt / cost * 100, lossPct: pl / cost * 100, flatPct: pf / cost * 100, rr,
-            bePct: breakevenMove(S, c.strike, T2, sig, cost, half),
-            score: rr * liq * ivPen, S
-        };
-        pick.positionSize = calcPositionSize(pick, sc, s);
-        scored.push(pick);
+    if (!cands.length) return { picks: [], considered: 0, passed: 0, rejected: {}, level: null, nearMisses: [], relaxed: false };
+
+    const nearMissesAll = [];
+
+    for (const level of RELAX_LEVELS) {
+        const effective = { ...s, ...level.overrides };
+        const rejected = {}, scored = [];
+        for (const c of cands) {
+            const S = sc.S || c.S, m = metrics(c, S, sc.hv);
+            const res = scoreContract(c, sc, s, effective);
+            if (!res.ok) {
+                res.reasons.forEach(x => rejected[x] = (rejected[x] || 0) + 1);
+                if (level.name === 'A+') {
+                    nearMissesAll.push({
+                        symbol: c.symbol, strike: c.strike, expiry: c.expiry, daysLeft: c.daysLeft,
+                        ask: c.ask, bid: c.bid, oi: c.oi, trades: c.trades,
+                        spreadPct: m.spreadPct, delta: m.delta, ivHv: m.ivHv,
+                        reasons: res.reasons, distance: rejectionScore(c, m, res.reasons, effective)
+                    });
+                }
+                continue;
+            }
+            scored.push(res.pick);
+        }
+        if (scored.length) {
+            scored.sort((a, b) => b.score - a.score);
+            return {
+                picks: scored.slice(0, s.topN),
+                considered: cands.length,
+                passed: scored.length,
+                rejected,
+                level: level.name,
+                tag: level.tag,
+                relaxed: level.name !== 'A+',
+                nearMisses: []
+            };
+        }
     }
-    scored.sort((a, b) => b.score - a.score);
-    return { picks: scored.slice(0, s.topN), considered: cands.length, passed: scored.length, rejected };
+
+    nearMissesAll.sort((a, b) => a.distance - b.distance);
+    return {
+        picks: [], considered: cands.length, passed: 0,
+        rejected: {}, level: null, tag: null, relaxed: false,
+        nearMisses: nearMissesAll.slice(0, 3)
+    };
 }
+
 function horizonDaysFor(config) {
     const bars = (config.params && config.params.maxHoldBars) || 10;
     const tfMin = deps.TIMEFRAME_MINUTES[config.timeframe] || 30;
     const tradingDays = tfMin >= 1440 ? bars : Math.max(1, Math.ceil(bars * tfMin / 210));
     return Math.max(2, Math.ceil(tradingDays * 7 / 5));
 }
+
 async function buildScenario(config, price, liveS, indicators, s) {
     const stop = indicators && indicators.stop, atr = indicators && indicators.atr;
     const risk = stop && stop < price ? price - stop : atr ? 2 * atr : price * 0.03;
@@ -252,23 +317,36 @@ async function buildScenario(config, price, liveS, indicators, s) {
         hv: await hvFromDaily(config.symbol)
     };
 }
+
 const f0 = n => Math.round(n).toLocaleString('en-US');
 const pc = v => v === null || v === undefined ? '-' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}٪`;
 
 function formatRecommendation(symbol, sc, res, title = '🎯 انتخاب قرارداد کال') {
     let t = `${title} — ${symbol}\nسناریو: ورود ${f0(sc.entry)} | حد ضرر ${f0(sc.stop)} | هدف ${f0(sc.target)} | افق ~${sc.horizonDays} روز${sc.hv ? ` | HV ${(sc.hv * 100).toFixed(0)}٪` : ''}\n`;
-    if (!res.picks.length) {
-        return t + `⛔ قرارداد مناسبی یافت نشد (${res.considered} بررسی شد)\n` +
-            Object.entries(res.rejected).map(([k, v]) => `• ${k}: ${v}`).join('\n');
+
+    if (res.level && res.level !== 'A+') {
+        t += `\n⚠️ سطح فیلتر: ${res.level}${res.tag ? ' — ' + res.tag : ''}\n`;
     }
+
+    if (!res.picks.length) {
+        t += `⛔ قرارداد مناسبی یافت نشد (${res.considered} بررسی شد)\n`;
+        if (res.nearMisses && res.nearMisses.length) {
+            t += `\n📋 نزدیک‌ترین گزینه‌ها (رد شدند):\n`;
+            res.nearMisses.forEach((n, i) => {
+                t += `${i + 1}) ${n.symbol} | اعمال ${f0(n.strike)} | ${n.daysLeft} روز\n` +
+                     `   OI ${n.oi} | معاملات ${n.trades} | اسپرد ${n.spreadPct ? n.spreadPct.toFixed(1) + '٪' : '-'} | دلتا ${n.delta ? n.delta.toFixed(2) : '-'}\n` +
+                     `   دلایل رد: ${n.reasons.join('، ')}\n`;
+            });
+        }
+        return t;
+    }
+
     res.picks.forEach((p, i) => {
         t += `\n${i + 1}) ${p.symbol} | اعمال ${f0(p.strike)} | ${p.expiry} (${p.daysLeft} روز)\n` +
             `   خرید ${f0(p.ask)} (اسپرد ${p.spreadPct.toFixed(1)}٪) | منصفانه ${f0(p.theo)} | IV ${p.iv ? (p.iv * 100).toFixed(0) + '٪' : '-'}${p.ivHv ? ` (${p.ivHv.toFixed(2)}×HV)` : ''}\n` +
             `   دلتا ${p.delta.toFixed(2)} | اهرم ${p.leverage.toFixed(1)}x | OI ${p.oi} | تتا/روز ${f0(p.thetaDay)} | سربه‌سر تا افق ${pc(p.bePct)}\n` +
             `   هدف ${pc(p.profitPct)} | حد ضرر ${pc(p.lossPct)} | بی‌حرکت ${pc(p.flatPct)} | RR ${p.rr.toFixed(2)} | حجم پیشنهادی ${p.positionSize} قرارداد`;
     });
-    const rej = Object.entries(res.rejected);
-    if (rej.length) t += `\n\n⛔ رد شده ${res.considered - res.passed}: ` + rej.map(([k, v]) => `${k} ${v}`).join('، ');
     return t;
 }
 
@@ -334,7 +412,6 @@ async function managePositions(chain) {
             .map(x => x.configId)
     );
 
-    // ✅ رفع باگ: محاسبه دقیق دقیقه تهران
     const now = new Date();
     const tehranMin = now.getUTCHours() * 60 + now.getUTCMinutes() + 210;
     const isLast30Min = tehranMin >= 720 && tehranMin <= 750;
@@ -442,6 +519,32 @@ async function storeSnapshots(chain, monitoredSet) {
     return docs.length;
 }
 
+async function storeFullOptionHistory(chain, monitoredSet) {
+    const time = new Date();
+    const docs = chain.filter(c => wanted(c, monitoredSet)).map(c => ({
+        symbol: c.symbol,
+        underlying: c.underlying,
+        strike: c.strike,
+        expiry: c.expiry,
+        daysLeft: c.daysLeft,
+        time,
+        S: c.S,
+        bid: c.bid, ask: c.ask, last: c.last,
+        bidVol: c.bidVol, askVol: c.askVol,
+        oi: c.oi, volume: c.volume, trades: c.trades,
+        ivApi: c.ivApi, hvApi: c.hvApi,
+        deltaApi: c.deltaApi, gammaApi: c.gammaApi,
+        thetaApi: c.thetaApi, vegaApi: c.vegaApi,
+        bsApi: c.bsApi
+    }));
+    if (docs.length) {
+        try {
+            await deps.getDB().collection('option_history').insertMany(docs, { ordered: false });
+        } catch (e) { /* ممکنه ایندکس یونیک داشته باشه */ }
+    }
+    return docs.length;
+}
+
 async function storeEOD(chain, monitoredSet) {
     const date = deps.todayDateString(), col = deps.getDB().collection('option_daily');
     let n = 0;
@@ -473,11 +576,14 @@ async function ensureIndexes() {
     await db.collection('option_daily').createIndex({ symbol: 1, date: 1 }, { unique: true });
     await db.collection('option_daily').createIndex({ underlying: 1, date: 1 });
     await db.collection('option_positions').createIndex({ status: 1, configId: 1 });
+    await db.collection('option_history').createIndex({ symbol: 1, time: 1 });
+    await db.collection('option_history').createIndex({ underlying: 1, time: 1 });
+    await db.collection('option_history').createIndex({ time: 1 });
 }
 
 async function storageStats() {
     const db = deps.getDB(), st = await db.stats();
-    const names = ['candles_base', 'candles_daily', 'candles_tf', 'option_snapshots', 'option_daily', 'option_positions', 'signal_history', 'trades', 'telegram_outbox', 'logs'];
+    const names = ['candles_base', 'candles_daily', 'candles_tf', 'option_snapshots', 'option_daily', 'option_history', 'option_positions', 'signal_history', 'trades', 'telegram_outbox', 'logs'];
     const cols = [];
     for (const n of names) {
         try {
@@ -515,7 +621,6 @@ function positionStats(list) {
 }
 
 // ---------------- بک‌تست تقریبی آپشن ----------------
-// ✅ رفع باگ: حذف entryIv (هرگز ست نمی‌شد)
 const OPT_BT_DEFAULTS = { assumedMaturityDays: 45, ivMultiplier: 1.2, spreadPct: 5 };
 
 function historicalHV(closes, uptoIndex, n = 20) {
@@ -598,6 +703,94 @@ async function runApproxOptionBacktest(symbol, closedTrades, opts = {}) {
     return result;
 }
 
+// ---------------- بک‌تست دقیق با option_history ----------------
+async function runRealOptionBacktest(symbol, closedTrades, opts = {}) {
+    const db = deps.getDB();
+    const p = { assumedMaturityDays: 45, deltaMin: 0.35, deltaMax: 0.85, minDays: 20, maxDays: 90, ...opts };
+
+    const sampleCount = await db.collection('option_history').countDocuments({ underlying: norm(symbol) });
+    if (sampleCount < 50) {
+        return {
+            available: false,
+            reason: `دیتای کافی برای بک‌تست دقیق وجود ندارد (${sampleCount} رکورد). از بک‌تست تقریبی استفاده کنید.`
+        };
+    }
+
+    const trades = [];
+    for (const t of closedTrades) {
+        const entryDate = new Date(t.entryTime * 1000);
+        const exitDate = new Date(t.exitTime * 1000);
+
+        const entryCandidates = await db.collection('option_history').find({
+            underlying: norm(symbol),
+            time: { $gte: new Date(entryDate.getTime() - 5 * 60 * 1000), $lte: new Date(entryDate.getTime() + 5 * 60 * 1000) },
+            daysLeft: { $gte: p.minDays, $lte: p.maxDays },
+            bid: { $gt: 0 }, ask: { $gt: 0 },
+            oi: { $gt: 0 }
+        }).toArray();
+
+        if (!entryCandidates.length) continue;
+
+        const targetDelta = 0.6;
+        let best = null, bestDiff = Infinity;
+        for (const c of entryCandidates) {
+            const delta = c.deltaApi || 0;
+            if (delta < p.deltaMin || delta > p.deltaMax) continue;
+            const diff = Math.abs(delta - targetDelta);
+            if (diff < bestDiff) { bestDiff = diff; best = c; }
+        }
+        if (!best) continue;
+
+        const exitRows = await db.collection('option_history').find({
+            symbol: best.symbol,
+            time: { $gte: new Date(exitDate.getTime() - 5 * 60 * 1000), $lte: new Date(exitDate.getTime() + 5 * 60 * 1000) }
+        }).toArray();
+
+        let exitBid = null;
+        if (exitRows.length) {
+            exitBid = exitRows[0].bid;
+        } else {
+            const lastRow = await db.collection('option_history').find({
+                symbol: best.symbol,
+                time: { $lt: exitDate }
+            }).sort({ time: -1 }).limit(1).toArray();
+            if (lastRow.length) exitBid = lastRow[0].bid;
+        }
+        if (!exitBid) continue;
+
+        const entryCost = best.ask * (1 + FEE_BUY);
+        const exitProceeds = exitBid * (1 - FEE_SELL);
+        const pnlPct = (exitProceeds / entryCost - 1) * 100;
+
+        trades.push({
+            entryTime: t.entryTime, exitTime: t.exitTime,
+            stockEntry: t.entryPrice, stockExit: t.exitPrice,
+            symbol: best.symbol, strike: best.strike, expiry: best.expiry, daysLeft: best.daysLeft,
+            optionEntry: best.ask, optionExit: exitBid,
+            delta: best.deltaApi, iv: best.ivApi, hv: best.hvApi,
+            pnlPct, exitReason: t.exitReason
+        });
+    }
+
+    const wins = trades.filter(x => x.pnlPct > 0);
+    const sum = a => a.reduce((s, x) => s + x.pnlPct, 0);
+    const gp = sum(wins), gl = -sum(trades.filter(x => x.pnlPct <= 0));
+    const pf = gl > 0 ? gp / gl : (gp > 0 ? null : 0);
+
+    return {
+        available: true,
+        stats: {
+            count: trades.length,
+            winRate: trades.length ? wins.length / trades.length * 100 : 0,
+            avgPnl: trades.length ? sum(trades) / trades.length : 0,
+            totalPnl: sum(trades),
+            profitFactor: pf
+        },
+        trades,
+        coverage: closedTrades.length ? trades.length / closedTrades.length * 100 : 0
+    };
+}
+
 // ---------------- روت‌ها ----------------
 function registerRoutes(app, ObjectId) {
     app.get('/api/options/settings', async (req, res, next) => {
@@ -671,7 +864,7 @@ function registerRoutes(app, ObjectId) {
 
 module.exports = {
     init, norm, ensureIndexes, registerRoutes, fetchChain,
-    storeSnapshots, storeEOD, managePositions, onBuySignal,
+    storeSnapshots, storeFullOptionHistory, storeEOD, managePositions, onBuySignal,
     openPositionsCount, storageStats, positionStats,
-    getSettings, runApproxOptionBacktest, reloadFromSettings
+    getSettings, runApproxOptionBacktest, runRealOptionBacktest, reloadFromSettings
 };

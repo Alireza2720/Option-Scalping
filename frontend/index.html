@@ -161,6 +161,73 @@
         table.data-table th, table.data-table td { padding:5px 5px; font-size:11px; }
         .menu-panel { width:280px; }
     }
+        /* ردیف داده ناکافی */
+        tr.insufficient-row { background: rgba(217, 83, 79, .08); }
+        tr.insufficient-row:hover { background: rgba(217, 83, 79, .15); }
+        .insufficient-badge {
+            display: inline-block;
+            background: rgba(217, 83, 79, .2);
+            color: var(--bad);
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10.5px;
+            font-weight: 600;
+            cursor: help;
+        }
+
+        /* آکاردئون تنظیمات پیشرفته */
+        .adv-accordion {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        .adv-header {
+            padding: 10px 14px;
+            background: var(--bg-input);
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--text-dim);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background .15s;
+        }
+        .adv-header:hover { background: var(--border); }
+        .adv-body { display: none; padding: 12px 14px; border-top: 1px solid var(--border); }
+        .adv-accordion.open .adv-body { display: block; }
+        .adv-accordion.open .adv-header .chev { transform: rotate(180deg); }
+        .adv-header .chev { transition: transform .2s; }
+
+        /* Pagination */
+        .show-more-btn {
+            display: block;
+            width: 100%;
+            text-align: center;
+            padding: 10px;
+            background: var(--bg-input);
+            border: 1px dashed var(--border-light);
+            border-radius: 8px;
+            cursor: pointer;
+            color: var(--text-dim);
+            font-size: 12.5px;
+            font-family: inherit;
+            margin-top: 8px;
+            transition: all .15s;
+        }
+        .show-more-btn:hover { background: var(--border); color: var(--text); border-color: var(--accent); }
+
+        /* راهنما */
+        .guide-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 14px; flex-wrap: wrap; }
+        .guide-content h4 { font-size: 14px; color: var(--accent); margin: 16px 0 8px; }
+        .guide-content h4:first-child { margin-top: 0; }
+        .guide-content p { font-size: 13px; line-height: 1.9; margin-bottom: 8px; color: var(--text); }
+        .guide-content ul { padding-right: 20px; margin-bottom: 10px; }
+        .guide-content li { font-size: 13px; margin-bottom: 6px; }
+        .guide-content .badge-win { display: inline-block; background: rgba(46,168,138,.15); color: var(--good); padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin-left: 4px; }
+        .guide-content .badge-pf { display: inline-block; background: rgba(61,125,216,.15); color: var(--accent); padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin-left: 4px; }
+        .guide-content .tip { background: rgba(201,151,61,.1); border-right: 3px solid var(--warn); padding: 8px 12px; border-radius: 4px; font-size: 12.5px; margin: 10px 0; }
+        .guide-content .warn { background: rgba(217,83,79,.1); border-right: 3px solid var(--bad); padding: 8px 12px; border-radius: 4px; font-size: 12.5px; margin: 10px 0; }
 </style>
 </head>
 <body>
@@ -200,6 +267,11 @@
     <div class="menu-divider"></div>
     <div class="menu-label">تنظیمات</div>
     <button class="menu-item" onclick="openSettings(); toggleMenu();">تنظیمات</button>
+
+    <div class="menu-divider"></div>
+    <div class="menu-label">راهنما و ابزار</div>
+    <button class="menu-item" onclick="openGuide(); toggleMenu();">📚 راهنمای استراتژی‌ها</button>
+    <button class="menu-item" onclick="openBacktestCompare(); toggleMenu();">🔬 بک‌تست مقایسه‌ای</button>
 
     <div class="menu-divider"></div>
     <div class="menu-label">عملیات</div>
@@ -331,8 +403,23 @@ const PARAM_LABELS = {
     useSessionEndExit:'خروج در پایان پنجره (1/0)',
     requireDisplacement:'نیاز به Displacement (1/0)', displacementMult:'ضریب Displacement',
     // OB + Sweep
-    obLookback:'تعداد کندل جستجوی Order Block', minSweepPct:'حداقل عمق شکار نقدینگی (٪)'
+    obLookback:'تعداد کندل جستجوی Order Block', minSweepPct:'حداقل عمق شکار نقدینگی (٪)',
+    // Ensemble
+    threshold:'آستانه مجموع وزن (پیشنهاد 1.5)', minAgree:'حداقل تعداد استراتژی موافق',
+    wRsi:'وزن RSI', wEma:'وزن EMA', wMacd:'وزن MACD', wIchimoku:'وزن Ichimoku',
+    wSmc:'وزن SMC Unicorn', wSilver:'وزن Silver Bullet', wOb:'وزن OB+Sweep'
 };
+
+// پارامترهای «پیشرفته» که در آکاردئون بسته قرار می‌گیرند
+const ADVANCED_PARAMS = new Set([
+    'lookback', 'rsiOversold', 'rsiOverbought', 'pullbackPct', 'exitBufferPct',
+    'fvgMinGapPct', 'oteLow', 'oteHigh', 'minLiquiditySweepPct', 'minConfluence',
+    'useKillzone', 'killzone1Start', 'killzone1End', 'killzone2Start', 'killzone2End',
+    'sb1Start', 'sb1End', 'sb2Start', 'sb2End', 'sb3Start', 'sb3End',
+    'requireDisplacement', 'displacementMult', 'obLookback', 'minSweepPct',
+    'wRsi', 'wEma', 'wMacd', 'wIchimoku', 'wSmc', 'wSilver', 'wOb',
+    'requireVolumeFilter', 'requireNoLowerWick', 'useOTE', 'useBreakEven', 'useSessionEndExit'
+]);
 const IND_LABELS = { rsiFast:'RSI سریع', rsiSlow:'RSI کند', emaFast:'EMA سریع', emaMid:'EMA میانی', emaSlow:'EMA کند', atr:'ATR', stop:'حد ضرر',
     macd:'MACD', signal:'Signal', hist:'هیستوگرام', tenkan:'Tenkan', kijun:'Kijun', spanA:'Span A', spanB:'Span B' };
 const OPT_LABELS = { minDays:'حداقل روز تا سررسید', maxDays:'حداکثر روز تا سررسید', maxSpreadPct:'حداکثر اسپرد (٪)', minOI:'حداقل موقعیت باز', minTrades:'حداقل معامله امروز', minPremium:'حداقل پرمیوم (ریال)', deltaMin:'حداقل دلتا', deltaMax:'حداکثر دلتا', maxIvHv:'حداکثر IV/HV', rewardRisk:'هدف = چند برابر ریسک', topN:'تعداد پیشنهاد', optionStopPct:'حد ضرر آپشن (٪)', take1Pct:'هشدار نیمه‌فروش (٪)', take2Pct:'حد سود کامل (٪)', closeDaysBefore:'بستن X روز قبل سررسید' };
@@ -568,8 +655,30 @@ async function loadStrategies() {
 }
 function onStrategyChange() {
     const s = strategiesInfo.find(x => x.id === document.getElementById('strategySelect').value); if (!s) return;
-    const c = document.getElementById('paramsContainer'); c.innerHTML = '';
-    Object.entries(s.defaultParams).forEach(([k, v]) => c.innerHTML += `<div class="field"><label>${PARAM_LABELS[k]||k}</label><input type="number" step="any" id="param_${k}" value="${v}"></div>`);
+    const c = document.getElementById('paramsContainer');
+
+    // تقسیم به پایه و پیشرفته
+    const basic = [], advanced = [];
+    Object.entries(s.defaultParams).forEach(([k, v]) => {
+        const html = `<div class="field"><label>${PARAM_LABELS[k]||k}</label><input type="number" step="any" id="param_${k}" value="${v}"></div>`;
+        if (ADVANCED_PARAMS.has(k)) advanced.push(html);
+        else basic.push(html);
+    });
+
+    let html = '';
+    if (basic.length) html += `<div class="form-row">${basic.join('')}</div>`;
+    if (advanced.length) {
+        html += `<div class="adv-accordion" id="advAccordion">
+            <div class="adv-header" onclick="document.getElementById('advAccordion').classList.toggle('open')">
+                <span>⚙️ تنظیمات پیشرفته (${advanced.length} پارامتر)</span>
+                <span class="chev">▼</span>
+            </div>
+            <div class="adv-body">
+                <div class="form-row">${advanced.join('')}</div>
+            </div>
+        </div>`;
+    }
+    c.innerHTML = html;
     document.getElementById('timeframeSelect').value = s.defaultTimeframe;
     document.getElementById('htfSelect').value = s.htfTimeframe || '1d';
 }
@@ -613,10 +722,13 @@ function renderConfigs() {
             if (st && !st.insufficientData && st.position === 'LONG') posBadge = '<span class="badge long">در کال</span>';
             const queue = st && st.queue === 'buy' ? ' <span class="badge warn">صف خرید</span>' : st && st.queue === 'sell' ? ' <span class="badge short">صف فروش</span>' : '';
             const active = `<input type="checkbox" ${it.enabled?'checked':''} onchange="toggleConfigEnabled('${id}', this.checked)">`;
-            const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny outline" onclick="showKandelDetail('${id}')">جزئیات</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
+            const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
+            const st2 = statusMap[id];
+            const insufTip = st2 ? `کندل ورود: ${st2.candleCount||0}/${st2.requiredCandles||0} · کندل بالا: ${st2.htfCandleCount||0}/${st2.requiredHtfCandles||0}` : '';
             const symbolCell = idx === 0 ? `<td rowspan="${items.length}" style="font-weight:600; background:var(--bg-input); border-left:2px solid var(--accent); vertical-align:middle;"><b>${esc(symbol)}</b>${insufBadge}</td>` : '';
-            const rowClass = idx === 0 ? 'symbol-start' : '';
-            html += `<tr class="${rowClass}">${symbolCell}<td>${esc(name)}${queue}</td><td>${tf}</td><td>${candle}</td><td>${trend}</td><td>${posBadge}</td><td>${active}</td><td>${actions}</td></tr>`;
+            const rowClass = (idx === 0 ? 'symbol-start ' : '') + (insufficient ? 'insufficient-row' : '');
+            const insufChip = insufficient ? `<span class="insufficient-badge" title="${esc(insufTip)}">داده ناکافی</span>` : '';
+            html += `<tr class="${rowClass}">${symbolCell}<td>${esc(name)}${queue}${insufChip?' '+insufChip:''}</td><td>${tf}</td><td>${candle}</td><td>${trend}</td><td>${posBadge}</td><td>${active}</td><td>${actions}</td></tr>`;
         });
     }
     tb.innerHTML = html;
@@ -626,22 +738,7 @@ async function deleteConfig(id) {
     if (!confirm('این تنظیم حذف شود؟')) return;
     try { await apiFetch(`${BACKEND_URL}/api/strategy-configs/${id}`, { method:'DELETE' }); if (selectedConfigId === id) selectedConfigId = null; await loadConfigs(); } catch (e) { showAlert('خطا: ' + e.message); }
 }
-function showKandelDetail(id) {
-    const it = configs.find(c => c._id === id); if (!it) return;
-    const st = statusMap[id], s = strategiesInfo.find(x => x.id === it.strategyId);
-    const candleCount = st ? (st.candleCount || 0) : 0;
-    const required = st ? (st.requiredCandles || 0) : 0;
-    const htfCount = st ? (st.htfCandleCount || 0) : 0;
-    const htfRequired = st ? (st.requiredHtfCandles || 0) : 0;
-    const dataReady = st && !st.insufficientData;
-    openModal(`جزئیات ${it.symbol} — ${s?s.name:it.strategyId}`, `
-        <div class="stats-grid">
-            <div class="stat"><small>کندل ${TF_LABELS[it.timeframe]}</small><b>${candleCount} / ${required}</b></div>
-            <div class="stat"><small>کندل ${TF_LABELS[it.htfTimeframe||'1d']}</small><b>${htfCount} / ${htfRequired}</b></div>
-            <div class="stat"><small>وضعیت</small><b style="color:${dataReady?'var(--good)':'var(--warn)'};">${dataReady?'آماده‌ی ارزیابی':'منتظر داده'}</b></div>
-            <div class="stat"><small>آخرین به‌روزرسانی</small><b>${st && st.updatedAt ? new Date(st.updatedAt).toLocaleTimeString('fa-IR') : '-'}</b></div>
-        </div>`);
-}
+
 
 async function runOptionBacktest(id) {
     const it = configs.find(c => c._id === id); if (!it) return;
@@ -665,14 +762,30 @@ async function runOptionBacktest(id) {
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
 
+let signalHistoryLimit = 5;
+let signalHistoryCache = null;
+
 async function loadSignalHistory() {
     try {
-        const h = await apiFetch(`${BACKEND_URL}/api/signal-history`), tb = document.getElementById('signalHistoryBody');
-        if (!h.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">سیگنالی ثبت نشده است</td></tr>';
-        tb.innerHTML = h.map(x => `<tr><td>${fmtT(x.time)}</td><td>${esc(x.symbol)}</td><td>${esc(x.strategyName||x.strategyId)} · ${TF_LABELS[x.timeframe]||''}</td><td>${SIGNAL_LABELS[x.signalType]||x.signalType}</td><td>${x.price?x.price.toLocaleString():'-'}</td><td>${trendBadge(x.htfTrend)}</td><td style="font-size:11px;">${esc(x.reason||'-')}</td>
-            <td>${x.confluence>1?`<span class="badge long">🔥 ${x.confluence}x</span>`:''}${x.queue==='buy'?'<span class="badge warn">صف خرید</span>':''}${x.signalType==='BUY'&&x.inWindow===false?'<span class="badge warn">خارج بازه</span>':''}${x.incomplete?'<span class="badge warn">ناقص</span>':''}</td></tr>`).join('');
+        const h = await apiFetch(`${BACKEND_URL}/api/signal-history`);
+        signalHistoryCache = h;
+        signalHistoryLimit = 5;
+        renderSignalHistory();
     } catch (e) { showAlert('خطا در تاریخچه: ' + e.message); }
 }
+
+function renderSignalHistory() {
+    const tb = document.getElementById('signalHistoryBody');
+    const list = signalHistoryCache || [];
+    if (!list.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">سیگنالی ثبت نشده است</td></tr>';
+    const shown = list.slice(0, signalHistoryLimit);
+    tb.innerHTML = shown.map(x => `<tr><td>${fmtT(x.time)}</td><td>${esc(x.symbol)}</td><td>${esc(x.strategyName||x.strategyId)} · ${TF_LABELS[x.timeframe]||''}</td><td>${SIGNAL_LABELS[x.signalType]||x.signalType}</td><td>${x.price?x.price.toLocaleString():'-'}</td><td>${trendBadge(x.htfTrend)}</td><td style="font-size:11px;">${esc(x.reason||'-')}</td>
+        <td>${x.confluence>1?`<span class="badge long">🔥 ${x.confluence}x</span>`:''}${x.queue==='buy'?'<span class="badge warn">صف خرید</span>':''}${x.signalType==='BUY'&&x.inWindow===false?'<span class="badge warn">خارج بازه</span>':''}${x.incomplete?'<span class="badge warn">ناقص</span>':''}</td></tr>`).join('');
+    if (list.length > signalHistoryLimit) {
+        tb.innerHTML += `<tr><td colspan="8" style="padding:0;"><button class="show-more-btn" onclick="signalHistoryLimit += 5; renderSignalHistory();">نمایش ${Math.min(5, list.length - signalHistoryLimit)} مورد بیشتر (${list.length - signalHistoryLimit} باقی‌مانده)</button></td></tr>`;
+    }
+}
+
 async function clearSignalHistory() {
     if (!confirm('کل تاریخچه پاک شود؟')) return;
     try { await apiFetch(`${BACKEND_URL}/api/signal-history`, { method:'DELETE' }); await loadSignalHistory(); } catch (e) { showAlert('خطا: ' + e.message); }
@@ -783,12 +896,129 @@ async function openSettings() {
             </div>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
+async function openBacktestCompare() {
+    try {
+        // لیست نمادها و استراتژی‌ها
+        const symbolsHtml = monitoredSymbols.map(s => `<label style="display:inline-flex; align-items:center; gap:6px; margin:4px 8px 4px 0; font-size:13px;"><input type="checkbox" class="bt-symbol" value="${esc(s.symbol)}"> ${esc(s.symbol)}</label>`).join('');
+        const strategiesHtml = strategiesInfo.map(s => `<label style="display:inline-flex; align-items:center; gap:6px; margin:4px 8px 4px 0; font-size:13px;"><input type="checkbox" class="bt-strategy" value="${esc(s.id)}" checked> ${esc(s.name)}</label>`).join('');
+
+        openModal('🔬 بک‌تست مقایسه‌ای', `
+            <div class="hint">نمادها و استراتژی‌هایی که می‌خوای مقایسه بشن رو انتخاب کن. نتایج بر اساس Profit Factor مرتب می‌شن.</div>
+
+            <div style="margin:12px 0;">
+                <div style="font-size:12.5px; color:var(--text-dim); margin-bottom:6px;">نمادها:</div>
+                <div>${symbolsHtml || '<span class="empty-note">ابتدا نماد اضافه کن</span>'}</div>
+            </div>
+
+            <div style="margin:12px 0;">
+                <div style="font-size:12.5px; color:var(--text-dim); margin-bottom:6px;">استراتژی‌ها:</div>
+                <div>${strategiesHtml}</div>
+            </div>
+
+            <div class="form-row">
+                <div class="field"><label>تایم‌فریم ورود</label>
+                    <select id="btTf">${Object.keys(TF_LABELS).map(t => `<option value="${t}" ${t==='30m'?'selected':''}>${TF_LABELS[t]}</option>`).join('')}</select>
+                </div>
+                <div class="field"><label>تایم‌فریم بالا</label>
+                    <select id="btHtf"><option value="1d" selected>روزانه</option><option value="1h">۱ ساعت</option></select>
+                </div>
+                <div class="field"><label>نوع کندل</label>
+                    <select id="btCandle"><option value="heikin" selected>هیکن آشی</option><option value="simple">ساده</option></select>
+                </div>
+            </div>
+
+            <div style="margin:10px 0;">
+                <label style="display:inline-flex; align-items:center; gap:6px; font-size:13px;">
+                    <input type="checkbox" id="btRealOption"> استفاده از دیتای واقعی آپشن (دقیق‌تر، فقط اگه دیتا ذخیره شده)
+                </label>
+            </div>
+
+            <button class="btn" id="btRunBtn" onclick="runBacktestCompare()">اجرای بک‌تست</button>
+            <div id="btResults" style="margin-top:16px;"></div>
+        `);
+    } catch (e) { showAlert('خطا: ' + e.message); }
+}
+
+async function runBacktestCompare() {
+    const symbols = Array.from(document.querySelectorAll('.bt-symbol:checked')).map(c => c.value);
+    const strategyIds = Array.from(document.querySelectorAll('.bt-strategy:checked')).map(c => c.value);
+    if (!symbols.length) return showAlert('حداقل یک نماد انتخاب کن', 'warn');
+    if (!strategyIds.length) return showAlert('حداقل یک استراتژی انتخاب کن', 'warn');
+
+    const useRealOption = document.getElementById('btRealOption').checked;
+    const timeframe = document.getElementById('btTf').value;
+    const htfTimeframe = document.getElementById('btHtf').value;
+    const candleType = document.getElementById('btCandle').value;
+
+    const btn = document.getElementById('btRunBtn');
+    btn.disabled = true;
+    btn.textContent = 'در حال محاسبه...';
+    document.getElementById('btResults').innerHTML = '<div style="text-align:center;padding:20px;"><div style="width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 10px;"></div></div>';
+
+    try {
+        const r = await apiFetch(`${BACKEND_URL}/api/backtest-compare`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ symbols, strategyIds, timeframe, htfTimeframe, candleType, useRealOption })
+        }, 0);
+
+        if (!r.results || !r.results.length) {
+            document.getElementById('btResults').innerHTML = '<div class="empty-note">نتیجه‌ای یافت نشد.</div>';
+            return;
+        }
+
+        const rows = r.results.map((x, i) => {
+            if (x.error) return `<tr><td>${i+1}</td><td>${esc(x.symbol)}</td><td>${esc(x.strategyName)}</td><td colspan="8" style="color:var(--bad);">${esc(x.error)}</td></tr>`;
+            const o = x.option || {};
+            const s = x.stock || {};
+            return `<tr>
+                <td>${i+1}</td>
+                <td><b>${esc(x.symbol)}</b></td>
+                <td>${esc(x.strategyName)}</td>
+                <td>${s.closed || 0}</td>
+                <td>${(s.winRate || 0).toFixed(1)}٪</td>
+                <td>${s.avgPnl !== undefined ? pct(s.avgPnl) : '-'}</td>
+                <td>${o.count || 0}</td>
+                <td>${(o.winRate || 0).toFixed(1)}٪</td>
+                <td>${o.avgPnl !== undefined ? pct(o.avgPnl) : '-'}</td>
+                <td>${o.totalPnl !== undefined ? pct(o.totalPnl) : '-'}</td>
+                <td><b>${fmtPF(o.profitFactor)}</b></td>
+            </tr>`;
+        }).join('');
+
+        document.getElementById('btResults').innerHTML = `
+            <div class="hint">${r.count} نتیجه — مرتب‌شده بر اساس Profit Factor آپشن</div>
+            <div class="table-responsive"><table class="data-table">
+                <thead>
+                    <tr>
+                        <th>#</th><th>نماد</th><th>استراتژی</th>
+                        <th colspan="3" style="background:var(--bg-input);">سهم پایه</th>
+                        <th colspan="5" style="background:var(--bg-input);">آپشن ${useRealOption ? '(دقیق/تقریبی)' : '(تقریبی)'}</th>
+                    </tr>
+                    <tr>
+                        <th></th><th></th><th></th>
+                        <th>معامله</th><th>وین‌ریت</th><th>میانگین</th>
+                        <th>معامله</th><th>وین‌ریت</th><th>میانگین</th><th>کل</th><th>PF</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table></div>
+            <div class="hint" style="margin-top:10px;">💡 بهترین ردیف‌ها اون‌هایی هستن که PF بالا و تعداد معامله کافی دارن.</div>
+        `;
+    } catch (e) {
+        document.getElementById('btResults').innerHTML = `<div class="empty-note">خطا: ${esc(e.message)}</div>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'اجرای بک‌تست';
+    }
+}
 function switchSettingsTab(which, btn) {
     document.getElementById('tab-trading').style.display = which === 'trading' ? 'block' : 'none';
     document.getElementById('tab-option').style.display = which === 'option' ? 'block' : 'none';
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
 }
+
 async function saveTradingSettings() {
     const body = {}; window._tsKeys.forEach(k => { const v = document.getElementById(`ts_${k}`).value.trim(); if (v !== '') body[k] = v; });
     try { await apiFetch(`${BACKEND_URL}/api/trading-settings`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); showAlert('ذخیره شد.', 'success', 3000); await checkBackendStatus(); } catch (e) { showAlert('خطا: ' + e.message); }
@@ -853,19 +1083,35 @@ async function recommendOption(id) {
         openModal(`پیشنهاد آپشن ${it.symbol}`, head + `<div class="table-responsive"><table class="data-table"><thead><tr><th>#</th><th>قرارداد</th><th>اعمال</th><th>سررسید</th><th>خرید</th><th>منصفانه</th><th>IV</th><th>دلتا</th><th>اهرم</th><th>OI</th><th>سربه‌سر</th><th>هدف</th><th>حد ضرر</th><th>بی‌حرکت</th><th>RR</th><th>حجم</th></tr></thead><tbody>${picks}</tbody></table></div><div class="hint">بررسی‌شده ${r.considered} · قابل قبول ${r.passed}</div>`);
     } catch (e) { openModal('خطا', `<div class="empty-note">${esc(e.message)}</div>`); }
 }
+let optPositionsLimit = 5;
+let optPositionsCache = null;
+
 async function loadOptionPositions() {
     try {
         const r = await apiFetch(`${BACKEND_URL}/api/options/positions`), s = r.stats;
+        optPositionsCache = r.positions;
+        optPositionsLimit = 5;
         document.getElementById('optStats').innerHTML = (s.open + s.closed) ? `<div class="stat"><small>باز / بسته</small><b>${s.open} / ${s.closed}</b></div><div class="stat"><small>وین‌ریت</small><b>${s.winRate.toFixed(0)}٪</b></div><div class="stat"><small>بازده کل</small><b>${pct(s.totalPnl)}</b></div><div class="stat"><small>میانگین</small><b>${pct(s.avgPnl)}</b></div><div class="stat"><small>سود/زیان</small><b>${pct(s.avgWin)} / ${pct(s.avgLoss)}</b></div><div class="stat"><small>Profit Factor</small><b>${fmtPF(s.profitFactor)}</b></div>` : '<div class="empty-note">موقعیتی ثبت نشده است</div>';
-        const tb = document.getElementById('optBody');
-        if (!r.positions.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="12">موقعیتی ثبت نشده است</td></tr>';
-        tb.innerHTML = r.positions.map(p => { const cur = p.status==='closed' ? p.exitBid : p.lastBid, curS = p.status==='closed' ? p.exitS : p.lastS, pnl = p.status==='closed' ? p.pnlPct : p.lastPnlPct; return `<tr>
-            <td>${esc(p.underlying)}</td><td>${esc(p.symbol)}</td><td>${fmtN(p.strike)}</td><td>${p.expiry}${p.lastDaysLeft!==undefined&&p.status==='open'?` <small>(${p.lastDaysLeft})</small>`:''}</td>
-            <td>${new Date(p.entryTime).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</td><td>${fmtN(p.entryAsk)}</td><td>${fmtN(cur)}${p.status==='open'?' <span class="badge long">باز</span>':''}</td><td>${pct(pnl)}</td>
-            <td>${fmtN(p.entryS)} → ${fmtN(curS)}</td><td>${fmtIv(p.entryIv)} → ${fmtIv(p.lastIv)}</td><td style="font-size:11px;">${esc(p.exitReason||'-')}</td>
-            <td><button class="btn tiny danger" onclick="deleteOptionPosition('${p._id}')">×</button></td></tr>`; }).join('');
+        renderOptPositions();
     } catch (e) { showAlert('خطا: ' + e.message); }
 }
+
+function renderOptPositions() {
+    const tb = document.getElementById('optBody');
+    const list = optPositionsCache || [];
+    if (!list.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="12">موقعیتی ثبت نشده است</td></tr>';
+    const shown = list.slice(0, optPositionsLimit);
+    tb.innerHTML = shown.map(p => { const cur = p.status==='closed' ? p.exitBid : p.lastBid, curS = p.status==='closed' ? p.exitS : p.lastS, pnl = p.status==='closed' ? p.pnlPct : p.lastPnlPct; return `<tr>
+        <td>${esc(p.underlying)}</td><td>${esc(p.symbol)}</td><td>${fmtN(p.strike)}</td><td>${p.expiry}${p.lastDaysLeft!==undefined&&p.status==='open'?` <small>(${p.lastDaysLeft})</small>`:''}</td>
+        <td>${new Date(p.entryTime).toLocaleString('fa-IR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</td><td>${fmtN(p.entryAsk)}</td><td>${fmtN(cur)}${p.status==='open'?' <span class="badge long">باز</span>':''}</td><td>${pct(pnl)}</td>
+        <td>${fmtN(p.entryS)} → ${fmtN(curS)}</td><td>${fmtIv(p.entryIv)} → ${fmtIv(p.lastIv)}</td><td style="font-size:11px;">${esc(p.exitReason||'-')}</td>
+        <td><button class="btn tiny danger" onclick="deleteOptionPosition('${p._id}')">×</button></td></tr>`; }).join('');
+    // دکمه «نمایش بیشتر»
+    if (list.length > optPositionsLimit) {
+        tb.innerHTML += `<tr><td colspan="12" style="padding:0;"><button class="show-more-btn" onclick="optPositionsLimit += 5; renderOptPositions();">نمایش ${Math.min(5, list.length - optPositionsLimit)} مورد بیشتر (${list.length - optPositionsLimit} باقی‌مانده)</button></td></tr>`;
+    }
+}
+
 async function deleteOptionPosition(id) { if (!confirm('حذف شود؟')) return; try { await apiFetch(`${BACKEND_URL}/api/options/positions/${id}`, { method:'DELETE' }); await loadOptionPositions(); } catch (e) { showAlert('خطا: ' + e.message); } }
 
 async function openLogs(source='memory') {
@@ -890,6 +1136,7 @@ window.addEventListener('load', async () => {
     setInterval(checkBackendStatus, 60000); setInterval(loadConfigs, 60000); setInterval(loadMonitoredSymbols, 120000);
     setInterval(refreshQuotesOnly, 30000);
     setInterval(loadSignalHistory, 60000); setInterval(loadOptionPositions, 60000);
+    // نکته: loadSignalHistory و loadOptionPositions الان فقط limit رو ریست می‌کنن
     setInterval(() => { if (selectedConfigId) viewChart(selectedConfigId); }, 60000);
 });
 window.addEventListener('resize', () => { const pc = document.getElementById('priceChart'), rc = document.getElementById('panelChart'); priceChart && pc && priceChart.applyOptions({ width: pc.clientWidth }); panelChart && rc && panelChart.applyOptions({ width: rc.clientWidth }); });
