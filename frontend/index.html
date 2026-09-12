@@ -744,26 +744,62 @@ function showInsufficientReason(id) {
     const st = statusMap[id];
     if (!st) return showAlert('وضعیت این استراتژی هنوز محاسبه نشده.');
     const s = strategiesInfo.find(x => x.id === it.strategyId);
+    const tfLabel = TF_LABELS[it.timeframe] || it.timeframe;
+    const htfLabel = TF_LABELS[it.htfTimeframe || '1d'] || '1d';
     const candleCount = st.candleCount || 0;
     const required = st.requiredCandles || 0;
     const htfCount = st.htfCandleCount || 0;
     const htfRequired = st.requiredHtfCandles || 0;
-    const missing = [];
-    if (candleCount < required) missing.push(`${required - candleCount} کندل ${TF_LABELS[it.timeframe]||it.timeframe} دیگر لازم است`);
-    if (htfCount < htfRequired) missing.push(`${htfRequired - htfCount} کندل ${TF_LABELS[it.htfTimeframe||'1d']} دیگر لازم است`);
-    openModal(`داده ناکافی — ${it.symbol}`, `
-        <div class="hint">استراتژی: ${esc(s?s.name:it.strategyId)}</div>
-        <div class="stats-grid" style="margin-top:12px;">
-            <div class="stat"><small>کندل ورود (${TF_LABELS[it.timeframe]||it.timeframe})</small><b>${candleCount} / ${required}</b> ${candleCount < required ? '<span class="badge warn">کم</span>' : '<span class="badge long">کافی</span>'}</div>
-            <div class="stat"><small>کندل روند (${TF_LABELS[it.htfTimeframe||'1d']})</small><b>${htfCount} / ${htfRequired}</b> ${htfCount < htfRequired ? '<span class="badge warn">کم</span>' : '<span class="badge long">کافی</span>'}</div>
+    const optCount = st.optionContractCount || 0;
+    const missingCandles = Math.max(0, required - candleCount);
+    const missingHtf = Math.max(0, htfRequired - htfCount);
+
+    openModal(`دلیل داده ناکافی — ${it.symbol}`, `
+        <div class="hint" style="font-size:12.5px;">استراتژی: <b>${esc(s?s.name:it.strategyId)}</b> · تایم‌فریم ورود: <b>${tfLabel}</b> · روند: <b>${htfLabel}</b></div>
+
+        <h4 style="font-size:13px;color:var(--accent);margin:18px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);">۱. کندل‌های سهم پایه (دلیل اصلی)</h4>
+        <div class="hint" style="margin-top:0;">این استراتژی برای ارزیابی، به تعداد مشخصی کندل بسته‌شده در تایم‌فریم‌های زیر نیاز داره.</div>
+        <div class="stats-grid" style="margin-top:10px;">
+            <div class="stat">
+                <small>کندل ورود (${tfLabel})</small>
+                <b>${candleCount} / ${required}</b>
+                ${candleCount < required
+                    ? `<div style="margin-top:4px;"><span class="badge warn">${missingCandles} کندل کم</span></div>`
+                    : '<div style="margin-top:4px;"><span class="badge long">کافی</span></div>'}
+            </div>
+            <div class="stat">
+                <small>کندل روند (${htfLabel})</small>
+                <b>${htfCount} / ${htfRequired}</b>
+                ${htfCount < htfRequired
+                    ? `<div style="margin-top:4px;"><span class="badge warn">${missingHtf} کندل کم</span></div>`
+                    : '<div style="margin-top:4px;"><span class="badge long">کافی</span></div>'}
+            </div>
         </div>
-        ${missing.length ? `<div class="msg-warn" style="display:block;">${missing.join(' · ')}</div>` : ''}
-        <div class="hint" style="margin-top:14px; line-height:2;">
-            <b>راه‌های حل:</b><br>
-            • چند ساعت یا روز صبر کن تا کندل‌های جدید جمع بشن<br>
-            • از دکمه «دریافت تاریخچه روزانه» در بخش نمادهای زیر نظر استفاده کن (برای کندل‌های روند)<br>
-            • اگه استراتژی الان ستاپ نمی‌ده، تایم‌فریم ورود رو کوچک‌تر انتخاب کن<br>
-            • از دکمه «نمودار» برای دیدن وضعیت کندل‌ها استفاده کن
+
+        <h4 style="font-size:13px;color:var(--accent);margin:18px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);">۲. داده‌ی آپشن (اطلاعاتی)</h4>
+        <div class="stats-grid" style="margin-top:10px;">
+            <div class="stat">
+                <small>قرارداد آپشن موجود</small>
+                <b>${optCount}</b>
+                ${optCount === 0
+                    ? '<div style="margin-top:4px;"><span class="badge warn">هیچ قراردادی ذخیره نشده</span></div>'
+                    : '<div style="margin-top:4px;"><span class="badge long">موجود</span></div>'}
+            </div>
+        </div>
+        ${optCount === 0
+            ? `<div class="msg-warn" style="display:block;">داده‌ی آپشن این نماد هنوز ذخیره نشده. بعد از اولین تیک بازار (هر ۵ دقیقه) پر می‌شه. برای بررسی فوری، روی «زنجیره آپشن» در بخش نمادهای زیر نظر کلیک کن.</div>`
+            : ''}
+
+        <h4 style="font-size:13px;color:var(--accent);margin:18px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);">راه‌های حل</h4>
+        <ul style="padding-right:20px;font-size:12.5px;line-height:2;margin-bottom:12px;">
+            ${missingHtf > 0 ? `<li>برای کندل‌های روند (${htfLabel}): از دکمه «دریافت تاریخچه روزانه» در بخش نمادهای زیر نظر استفاده کن. با این کار همه‌ی کندل‌های تاریخی روزانه اضافه می‌شن.</li>` : ''}
+            ${missingCandles > 0 ? `<li>برای کندل‌های ورود (${tfLabel}): چند ساعت یا روز صبر کن تا کندل‌های جدید جمع بشن. سیستم در هر تیک کندل‌های تازه رو ذخیره می‌کنه.</li>` : ''}
+            ${(missingCandles > 0) ? `<li>اگه عجله داری، تایم‌فریم ورود رو کوچک‌تر انتخاب کن (مثلاً ${TF_LABELS['15m']} به‌جای ${tfLabel}) — به این ترتیب کندل‌های بیشتری در زمان کوتاه‌تر جمع می‌شن.</li>` : ''}
+            <li>روی «نمودار» کلیک کن تا ببینی چند کندل بسته‌شده واقعاً موجوده.</li>
+        </ul>
+
+        <div class="tip" style="background:rgba(61,125,216,.1);border-right:3px solid var(--accent);padding:10px 12px;border-radius:6px;font-size:12.5px;">
+            <b>نکته:</b> در بخش «نمادهای زیر نظر»، تعداد «کندل دقیقه‌ای» نمایش داده می‌شه که با کندل‌های تجمیعی تایم‌فریم استراتژی فرق داره. مثلاً ۵۰۰ کندل دقیقه‌ای می‌شه فقط ~۱۶ کندل ۳۰ دقیقه‌ای.
         </div>
     `);
 }

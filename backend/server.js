@@ -611,7 +611,19 @@ async function evaluateStrategyConfig(config, marketInfo) {
     const base = { configId, symbol: config.symbol, strategyId: config.strategyId, timeframe: config.timeframe, htfTimeframe: htfTf, candleCount: candles.length, requiredCandles: required, htfCandleCount: htfCandles.length, requiredHtfCandles: requiredHtf, updatedAt: new Date(), queue: info ? info.queue : null, livePrice: info ? info.price : null };
 
     if (candles.length < required || htfCandles.length < requiredHtf) {
-        await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: true, position: null } }, { upsert: true }); return;
+        // شمارش قراردادهای آپشن موجود برای این نماد
+        let optCount = 0;
+        try {
+            const names = getUnderlyingNames(config.symbol);
+            const contracts = await db.collection('option_daily').distinct('symbol', { underlying: { $in: names } });
+            optCount = contracts.length;
+            if (optCount === 0) {
+                const contracts2 = await db.collection('option_history').distinct('symbol', { underlying: { $in: names } });
+                optCount = contracts2.length;
+            }
+        } catch (e) {}
+        await stateColl.updateOne({ configId }, { $set: { ...base, insufficientData: true, position: null, optionContractCount: optCount } }, { upsert: true });
+        return;
     }
     let result;
     try { result = def.run(candles, { ...config.params, candleType: config.candleType }, { htfCandles, htfTimeframe: htfTf, entryWindow: { start: ENTRY_START, end: ENTRY_END } }); }
