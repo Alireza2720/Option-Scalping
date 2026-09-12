@@ -518,30 +518,32 @@ app.get('/api/backtest-option/:configId', async (req, res, next) => {
         res.json({ stockTradesCount: trades.length, stockClosedCount: closedTrades.length, ...result });
     } catch (e) { next(e); }
 });
-// ✅ بک‌تست مقایسه‌ای همه استراتژی‌ها روی نمادهای انتخابی
+// ✅ بک‌تست مقایسه‌ای همه استراتژی‌ها روی نمادهای انتخابی (با تنظیمات per-strategy)
 app.post('/api/backtest-compare', async (req, res, next) => {
     try {
-        const { symbols, strategyIds, timeframe, htfTimeframe, candleType, params, useRealOption } = req.body || {};
+        const { symbols, strategies, useRealOption } = req.body || {};
         if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: 'حداقل یک نماد انتخاب کنید' });
-        if (!Array.isArray(strategyIds) || !strategyIds.length) return res.status(400).json({ error: 'حداقل یک استراتژی انتخاب کنید' });
+        if (!Array.isArray(strategies) || !strategies.length) return res.status(400).json({ error: 'حداقل یک استراتژی انتخاب کنید' });
 
-        const tf = timeframe || '30m';
-        const htf = htfTimeframe || '1d';
         const results = [];
 
         for (const symbol of symbols) {
-            for (const sid of strategyIds) {
-                if (!STRATEGIES[sid]) continue;
+            for (const s of strategies) {
+                const def = STRATEGIES[s.id];
+                if (!def) continue;
                 const cfg = {
-                    symbol, strategyId: sid, timeframe: tf, htfTimeframe: htf,
-                    candleType: candleType || 'heikin',
-                    params: { ...STRATEGIES[sid].defaultParams, ...(params || {}) }
+                    symbol,
+                    strategyId: s.id,
+                    timeframe: s.timeframe || def.defaultTimeframe,
+                    htfTimeframe: s.htfTimeframe || def.htfTimeframe || '1d',
+                    candleType: s.candleType === 'simple' ? 'simple' : 'heikin',
+                    params: { ...def.defaultParams, ...(s.params || {}) }
                 };
                 try {
                     const { trades } = await computeStockBacktestTrades(cfg);
                     const closedTrades = trades.filter(t => t.status === 'closed');
                     const stockWins = closedTrades.filter(t => t.pnlPct > 0);
-                    const stockSum = closedTrades.reduce((s, t) => s + t.pnlPct, 0);
+                    const stockSum = closedTrades.reduce((acc, t) => acc + t.pnlPct, 0);
 
                     let optStats;
                     let optMode = 'approximate';
@@ -561,8 +563,12 @@ app.post('/api/backtest-compare', async (req, res, next) => {
                     }
 
                     results.push({
-                        symbol, strategyId: sid,
-                        strategyName: STRATEGIES[sid].name,
+                        symbol,
+                        strategyId: s.id,
+                        strategyName: def.name,
+                        timeframe: cfg.timeframe,
+                        htfTimeframe: cfg.htfTimeframe,
+                        candleType: cfg.candleType,
                         stock: {
                             total: trades.length,
                             closed: closedTrades.length,
@@ -574,12 +580,15 @@ app.post('/api/backtest-compare', async (req, res, next) => {
                         optionMode: optMode
                     });
                 } catch (e) {
-                    results.push({ symbol, strategyId: sid, strategyName: STRATEGIES[sid]?.name || sid, error: e.message });
+                    results.push({
+                        symbol, strategyId: s.id, strategyName: def.name,
+                        timeframe: cfg.timeframe, htfTimeframe: cfg.htfTimeframe, candleType: cfg.candleType,
+                        error: e.message
+                    });
                 }
             }
         }
 
-        // مرتب‌سازی بر اساس profitFactor آپشن
         results.sort((a, b) => {
             const pfA = a.option && a.option.profitFactor !== null && a.option.profitFactor !== undefined ? a.option.profitFactor : -1;
             const pfB = b.option && b.option.profitFactor !== null && b.option.profitFactor !== undefined ? b.option.profitFactor : -1;
