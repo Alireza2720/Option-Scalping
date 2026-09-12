@@ -714,26 +714,55 @@ function renderConfigs() {
     const tb = document.getElementById('configsBody');
     document.getElementById('configsCountLabel').textContent = configs.length;
     if (!configs.length) return tb.innerHTML = '<tr class="empty-row"><td colspan="8">تنظیمی ایجاد نشده است</td></tr>';
+
     const groups = {};
     configs.forEach(c => { if (!groups[c.symbol]) groups[c.symbol] = []; groups[c.symbol].push(c); });
+
     let html = '';
     for (const symbol of Object.keys(groups)) {
         const items = groups[symbol];
-        const insufficient = items.some(it => { const st = statusMap[it._id]; return st && st.insufficientData; });
+
         items.forEach((it, idx) => {
-            const id = it._id, st = statusMap[id], s = strategiesInfo.find(x => x.id === it.strategyId);
+            const id = it._id;
+            const st = statusMap[id];
+            const s = strategiesInfo.find(x => x.id === it.strategyId);
+
+            // ✅ چک per-item — نه per-symbol
+            const isInsufficient = !!(st && st.insufficientData);
+
             const name = s ? s.name : it.strategyId;
             const tf = `${TF_LABELS[it.timeframe]||it.timeframe} → ${TF_LABELS[it.htfTimeframe||'1d']}`;
             const candle = it.candleType === 'simple' ? 'ساده' : 'HA';
             const trend = st && st.htfTrend ? trendBadge(st.htfTrend) : '<span class="badge none">-</span>';
+
             let posBadge = '<span class="badge none">بدون موقعیت</span>';
-            if (st && !st.insufficientData && st.position === 'LONG') posBadge = '<span class="badge long">در کال</span>';
-            const queue = st && st.queue === 'buy' ? ' <span class="badge warn">صف خرید</span>' : st && st.queue === 'sell' ? ' <span class="badge short">صف فروش</span>' : '';
+            if (st && !isInsufficient && st.position === 'LONG') posBadge = '<span class="badge long">در کال</span>';
+
+            const queue = st && st.queue === 'buy'
+                ? ' <span class="badge warn">صف خرید</span>'
+                : st && st.queue === 'sell'
+                    ? ' <span class="badge short">صف فروش</span>'
+                    : '';
+
             const active = `<input type="checkbox" ${it.enabled?'checked':''} onchange="toggleConfigEnabled('${id}', this.checked)">`;
-            const actions = `<div class="action-btns"><button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button><button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button><button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button><button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button></div>`;
-            const insufChip = insufficient ? ` <span class="insufficient-badge" onclick="showInsufficientReason('${id}')">داده ناکافی</span>` : '';
-            const symbolCell = idx === 0 ? `<td rowspan="${items.length}" style="font-weight:600; background:var(--bg-input); border-left:2px solid var(--accent); vertical-align:middle;"><b>${esc(symbol)}</b></td>` : '';
-            const rowClass = (idx === 0 ? 'symbol-start ' : '') + (insufficient ? 'insufficient-row' : '');
+
+            const actions = `<div class="action-btns">
+                <button class="btn tiny outline" onclick="viewChart('${id}')">نمودار</button>
+                <button class="btn tiny outline" onclick="runOptionBacktest('${id}')">بک‌تست</button>
+                <button class="btn tiny outline" onclick="recommendOption('${id}')">آپشن</button>
+                <button class="btn tiny danger" onclick="deleteConfig('${id}')">حذف</button>
+            </div>`;
+
+            const insufChip = isInsufficient
+                ? ` <span class="insufficient-badge" onclick="showInsufficientReason('${id}')" title="کلیک کنید تا دلیل دقیق را ببینید">داده ناکافی</span>`
+                : '';
+
+            const symbolCell = idx === 0
+                ? `<td rowspan="${items.length}" style="font-weight:600; background:var(--bg-input); border-left:2px solid var(--accent); vertical-align:middle;"><b>${esc(symbol)}</b></td>`
+                : '';
+
+            const rowClass = (idx === 0 ? 'symbol-start ' : '') + (isInsufficient ? 'insufficient-row' : '');
+
             html += `<tr class="${rowClass}">${symbolCell}<td>${esc(name)}${queue}${insufChip}</td><td>${tf}</td><td>${candle}</td><td>${trend}</td><td>${posBadge}</td><td>${active}</td><td>${actions}</td></tr>`;
         });
     }
